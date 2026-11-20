@@ -99,6 +99,11 @@ typedef struct GakuScreenshotServiceV1 {
     GakuStatus (*captureFrameImmediate)(void* context, const GakuScreenshotFrameRequestV1* request,
         void* outPixels, size_t capacity, GakuScreenshotFrameInfoV1* outInfo,
         char* errorBuffer, uint32_t errorCapacity);
+    GakuStatus (*armPresentCapture)(void* context, uint64_t token, uint32_t width, uint32_t height,
+        uint32_t pixelFormat);
+    GakuStatus (*consumePresentCapture)(void* context, uint64_t* outToken, void* outPixels, size_t capacity,
+        GakuScreenshotFrameInfoV1* outInfo, char* errorBuffer, uint32_t errorCapacity);
+    GakuStatus (*cancelPresentCapture)(void* context);
 } GakuScreenshotServiceV1;
 
 #ifdef __cplusplus

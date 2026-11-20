@@ -37,8 +37,27 @@ export default {
         sm: 'calc(var(--radius) - 4px)',
       },
       fontFamily: {
-        sans: ['"Segoe UI"', 'Arial', '"Microsoft YaHei UI"', '"Microsoft YaHei"', 'system-ui', 'sans-serif'],
-        mono: ['"Segoe UI"', 'Arial', 'Cascadia Code', 'Consolas', 'monospace'],
+        sans: [
+          "var(--gaku-font-sans, 'Microsoft YaHei UI', 'PingFang SC', 'Segoe UI', system-ui, -apple-system, sans-serif)",
+        ],
+        mono: [
+          "var(--gaku-font-mono, 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace)",
+        ],
+      },
+      fontSize: {
+        'gaku-micro': ['var(--gaku-text-micro, 11px)', { lineHeight: '1.35' }],
+        'gaku-xs': ['var(--gaku-text-xs, 12px)', { lineHeight: '1.4' }],
+        'gaku-sm': ['var(--gaku-text-sm, 13px)', { lineHeight: '1.45' }],
+        'gaku-base': ['var(--gaku-text-base, 14px)', { lineHeight: '1.5' }],
+        'gaku-md': ['var(--gaku-text-md, 15px)', { lineHeight: '1.45' }],
+        'gaku-lg': ['var(--gaku-text-lg, 18px)', { lineHeight: '1.35' }],
+        'gaku-title': ['var(--gaku-text-title, 22px)', { lineHeight: '1.25' }],
+      },
+      height: {
+        'gaku-control': 'var(--gaku-control-height, 34px)',
+      },
+      minHeight: {
+        'gaku-control': 'var(--gaku-control-height, 34px)',
       },
       keyframes: {
         'accordion-down': { from: { height: '0' }, to: { height: 'var(--radix-accordion-content-height)' } },

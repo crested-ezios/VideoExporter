@@ -61,6 +61,11 @@ namespace
 		GakuMotionClockServiceV1 clock{};
 		bool hasAudio{false};
 		GakuAudioServiceV1 audio{};
+		bool hasRenderFrame{false};
+		GakuRenderFrameService renderFrame{};
+		bool renderFrameRegistered{false};
+		bool hasRenderFrameStatus{false};
+		GakuRenderFrameStatusService renderFrameStatus{};
 
 		std::mutex dialogMutex;
 		uint64_t dialogTicket{0};
@@ -159,8 +164,80 @@ namespace
 		auto* ctx = static_cast<PluginContext*>(userData);
 		if (ctx && ctx->recorder)
 		{
-			ctx->recorder->OnTick();
+			// Process session start/stop only; frame capture runs in OnTick /
+			// post-render so DrainTasks + OnTick never double-capture in one tick.
+			ctx->recorder->ProcessPendingControl();
 		}
+	}
+
+	void MainThreadAfterRenderTask(void* userData, int isNormalOuterFrame)
+	{
+		auto* ctx = static_cast<PluginContext*>(userData);
+		if (ctx && ctx->recorder && isNormalOuterFrame)
+		{
+			ctx->recorder->OnEndOfFrameCapture();
+		}
+	}
+
+	void EnsureRenderFrameRegistered(PluginContext* ctx)
+	{
+		if (!ctx || !ctx->host.queryService || !ctx->recorder) return;
+		std::lock_guard<std::mutex> lock(ctx->serviceCacheMutex);
+		if (ctx->renderFrameRegistered) return;
+		if (!ctx->hasRenderFrame)
+		{
+			GakuRenderFrameService rf{};
+			if (ctx->host.queryService(ctx->host.hostContext, GAKU_SERVICE_RENDER_FRAME,
+				GAKU_SERVICE_VERSION, sizeof(rf), &rf) == GAKU_OK &&
+				rf.abiVersion == GAKU_SERVICE_VERSION &&
+				rf.structSize >= sizeof(GakuRenderFrameService) &&
+				rf.registerObserver && rf.unregisterObserver)
+			{
+				ctx->renderFrame = rf;
+				ctx->hasRenderFrame = true;
+			}
+		}
+		if (!ctx->hasRenderFrameStatus)
+		{
+			GakuRenderFrameStatusService rfs{};
+			if (ctx->host.queryService(ctx->host.hostContext, GAKU_SERVICE_RENDER_FRAME_STATUS,
+				GAKU_SERVICE_VERSION, sizeof(rfs), &rfs) == GAKU_OK &&
+				rfs.abiVersion == GAKU_SERVICE_VERSION &&
+				rfs.structSize >= sizeof(GakuRenderFrameStatusService) &&
+				rfs.getStatus)
+			{
+				ctx->renderFrameStatus = rfs;
+				ctx->hasRenderFrameStatus = true;
+			}
+		}
+		if (!ctx->hasRenderFrame) return;
+		const GakuRenderFrameBinding binding{
+			GAKU_SERVICE_VERSION,
+			sizeof(GakuRenderFrameBinding),
+			"videoexporter.render-frame",
+			nullptr,
+			&MainThreadAfterRenderTask,
+			ctx
+		};
+		if (ctx->renderFrame.registerObserver(ctx->renderFrame.context, &binding) == GAKU_OK)
+		{
+			ctx->renderFrameRegistered = true;
+			const bool hookUnavailable = ctx->hasRenderFrameStatus && ctx->renderFrameStatus.getStatus &&
+				ctx->renderFrameStatus.getStatus() == GAKU_RENDER_FRAME_HOOK_UNAVAILABLE;
+			ctx->recorder->SetDeferredCaptureMode(!hookUnavailable);
+			WriteLog(ctx, GAKU_LOG_INFO, hookUnavailable
+				? "[VideoExporter] gakuloader.render-frame bound, but host render hook is unavailable; using OnTick capture."
+				: "[VideoExporter] Bound gakuloader.render-frame post-render capture.");
+		}
+	}
+
+	bool IsRenderFrameHookUnavailable(PluginContext* ctx)
+	{
+		if (!ctx) return false;
+		std::lock_guard<std::mutex> lock(ctx->serviceCacheMutex);
+		if (!ctx->renderFrameRegistered) return true;
+		if (!ctx->hasRenderFrameStatus || !ctx->renderFrameStatus.getStatus) return false;
+		return ctx->renderFrameStatus.getStatus() == GAKU_RENDER_FRAME_HOOK_UNAVAILABLE;
 	}
 
 	void OnToggleRecordingHotkey(void* userData)
@@ -408,6 +485,7 @@ namespace
 				rawCtx->mainThread.enqueue(rawCtx->mainThread.context, &MainThreadWakeTask, rawCtx);
 			}
 		};
+		recorderHost.isRenderFrameHookUnavailable = [rawCtx]() { return IsRenderFrameHookUnavailable(rawCtx); };
 		recorderHost.log = [rawCtx](GakuLogLevel level, const std::string& msg) { WriteLog(rawCtx, level, msg); };
 
 		ctx->recorder = std::make_unique<VideoExporter::VideoRecorder>(std::move(recorderHost));
@@ -511,6 +589,7 @@ namespace
 		QueryScreenshotLazy(ctx, ss);
 		QueryClockLazy(ctx, clk);
 		QueryAudioLazy(ctx, aud);
+		EnsureRenderFrameRegistered(ctx);
 	}
 
 	void OnTick(void* pluginState, float /*deltaTime*/)
@@ -524,6 +603,11 @@ namespace
 	{
 		auto* ctx = static_cast<PluginContext*>(pluginState);
 		if (!ctx) return;
+		if (ctx->renderFrameRegistered && ctx->renderFrame.unregisterObserver)
+		{
+			ctx->renderFrame.unregisterObserver(ctx->renderFrame.context);
+			ctx->renderFrameRegistered = false;
+		}
 		if (ctx->hotkeyRegistered && ctx->hotkeys.unregisterHotkey)
 		{
 			ctx->hotkeys.unregisterHotkey(ctx->hotkeys.context, "toggle-recording");

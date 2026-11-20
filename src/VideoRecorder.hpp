@@ -58,6 +58,7 @@ namespace VideoExporter
 		std::function<bool(GakuMotionClockServiceV1&)> queryClock;
 		std::function<bool(GakuAudioServiceV1&)> queryAudio;
 		std::function<void()> wakeMainThread;
+		std::function<bool()> isRenderFrameHookUnavailable;
 		std::function<void(GakuLogLevel, const std::string&)> log;
 	};
 
@@ -421,9 +422,34 @@ namespace VideoExporter
 			return RequestStart(error);
 		}
 
-		// Must be called on the Unity main thread once per frame.
-		void OnTick()
+		// When true, OnTick() only processes start/stop lifecycle control and
+		// skips frame capture; frame capture is driven by OnEndOfFrameCapture()
+		// after MotionActorTick and Unity rendering have completed.
+		void SetDeferredCaptureMode(bool enabled) noexcept
 		{
+			deferredCaptureMode_.store(enabled, std::memory_order_release);
+		}
+
+		bool IsDeferredCaptureMode() const noexcept
+		{
+			return deferredCaptureMode_.load(std::memory_order_acquire);
+		}
+
+		// Processes pending start/stop requests and writer errors on the Unity
+		// main thread without capturing a frame. Safe for MainThreadWakeTask.
+		void ProcessPendingControl()
+		{
+			if (writerError_.load(std::memory_order_acquire))
+			{
+				std::string wErr;
+				{
+					std::lock_guard<std::mutex> rl(ringMutex_);
+					wErr = writerErrorMsg_;
+				}
+				FinishRecordingCapture(true, true, wErr.empty() ? "FFmpeg 写入线程异常" : wErr);
+				return;
+			}
+
 			bool shouldStart = false;
 			bool shouldStop = false;
 			{
@@ -433,11 +459,7 @@ namespace VideoExporter
 					shouldStart = true;
 					pendingStart_ = false;
 				}
-				else if (phase_ != RecorderPhase::Recording)
-				{
-					return;
-				}
-				else if (pendingStop_)
+				else if (phase_ == RecorderPhase::Recording && pendingStop_)
 				{
 					shouldStop = true;
 					pendingStop_ = false;
@@ -447,15 +469,126 @@ namespace VideoExporter
 			if (shouldStart)
 			{
 				StartSessionSync();
-				TickActiveRecording();
 				return;
+			}
+			if (shouldStop)
+			{
+				FinishRecordingCapture(false, false, "");
+			}
+		}
+
+		// Must be called on the Unity main thread once per frame.
+		void OnTick()
+		{
+			bool wasRecording = false;
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				wasRecording = (phase_ == RecorderPhase::Recording);
+			}
+			ProcessPendingControl();
+
+			bool isRecordingNow = false;
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				isRecordingNow = (phase_ == RecorderPhase::Recording);
+			}
+
+			if (deferredCaptureMode_.load(std::memory_order_acquire))
+			{
+				if (isRecordingNow)
+				{
+					if (host_.isRenderFrameHookUnavailable && host_.isRenderFrameHookUnavailable())
+					{
+						deferredCaptureMode_.store(false, std::memory_order_release);
+						if (!deferredFallbackLogged_)
+						{
+							deferredFallbackLogged_ = true;
+							Log(GAKU_LOG_WARNING,
+								"[VideoExporter] Host render-frame hook unavailable; driving capture from OnTick.");
+						}
+					}
+					else if (wasRecording && ++ticksWithoutEndOfFrame_ >= kMaxTicksWithoutEndOfFrame)
+					{
+						deferredCaptureMode_.store(false, std::memory_order_release);
+						if (!deferredFallbackLogged_)
+						{
+							deferredFallbackLogged_ = true;
+							Log(GAKU_LOG_WARNING,
+								"[VideoExporter] Post-render observer silent; falling back to OnTick capture drive.");
+						}
+					}
+				}
+				if (deferredCaptureMode_.load(std::memory_order_acquire))
+				{
+					if (usePresentPath_)
+					{
+						PollPendingPresentCapture(false);
+					}
+					return;
+				}
+			}
+
+			if (usePresentPath_)
+			{
+				if (!PollPendingPresentCapture(false))
+				{
+					return;
+				}
+				if (usePresentPath_)
+				{
+					TryArmPresentCapture();
+					return;
+				}
+			}
+			TickActiveRecording();
+		}
+
+		// Must be called on the Unity main thread after actor pose/face updates
+		// and frame rendering have completed for the current frame.
+		void OnEndOfFrameCapture()
+		{
+			ticksWithoutEndOfFrame_ = 0;
+			if (writerError_.load(std::memory_order_acquire))
+			{
+				std::string wErr;
+				{
+					std::lock_guard<std::mutex> rl(ringMutex_);
+					wErr = writerErrorMsg_;
+				}
+				FinishRecordingCapture(true, true, wErr.empty() ? "FFmpeg 写入线程异常" : wErr);
+				return;
+			}
+
+			bool shouldStop = false;
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				if (phase_ != RecorderPhase::Recording)
+				{
+					return;
+				}
+				if (pendingStop_)
+				{
+					shouldStop = true;
+					pendingStop_ = false;
+				}
 			}
 			if (shouldStop)
 			{
 				FinishRecordingCapture(false, false, "");
 				return;
 			}
-
+			if (usePresentPath_)
+			{
+				if (!PollPendingPresentCapture(true))
+				{
+					return;
+				}
+				if (usePresentPath_)
+				{
+					TryArmPresentCapture();
+					return;
+				}
+			}
 			TickActiveRecording();
 		}
 
@@ -832,6 +965,13 @@ namespace VideoExporter
 				}
 			}
 
+			const bool canUsePresentPath =
+				HasPresentCaptureApi(ss) &&
+				ResolveScreenshotAlphaMode(cfg) == GAKU_SCREENSHOT_ALPHA_OPAQUE &&
+				!IsAlphaCodec(actualCodec) &&
+				ssCaps.windowWidth == cfg.width &&
+				ssCaps.windowHeight == cfg.height;
+
 			{
 				std::lock_guard<std::mutex> lock(stateMutex_);
 				screenshot_ = ss;
@@ -840,7 +980,17 @@ namespace VideoExporter
 				leaseId_ = leaseId;
 				leaseHeld_ = leaseHeld;
 				lastCapturedSerial_ = lastSerial;
+				hasCapturedUnityFrame_ = false;
+				lastCapturedUnityFrame_ = 0;
+				sameUnityFrameCaptures_ = 0;
+				usePresentPath_ = canUsePresentPath;
+				awaitingPresentToken_ = 0;
+				awaitingPresentPoseSerial_ = 0;
+				nextPresentToken_ = 1;
 				sawClockPlaying_ = sawPlaying;
+				ticksWithoutEndOfFrame_ = 0;
+				deferredFallbackLogged_ = false;
+				notifyErrorLogged_ = false;
 				targetFrames_ = computedTargetFrames;
 				capturedFrames_.store(0, std::memory_order_release);
 				writtenFrames_.store(0, std::memory_order_release);
@@ -860,7 +1010,14 @@ namespace VideoExporter
 
 			Log(GAKU_LOG_INFO, "[VideoExporter] Started recording: " + util::WideToUtf8(finalPath.wstring()) +
 				" (" + std::to_string(cfg.width) + "x" + std::to_string(cfg.height) + " @ " +
-				std::to_string(cfg.fps) + "fps, codec=" + actualCodec + ")");
+				std::to_string(cfg.fps) + "fps, codec=" + actualCodec +
+				", capture=" + (canUsePresentPath ? "swapchain-present" : "offscreen-camera") + ")");
+		}
+
+		static bool HasPresentCaptureApi(const GakuScreenshotServiceV1& ss) noexcept
+		{
+			return ss.structSize >= offsetof(GakuScreenshotServiceV1, cancelPresentCapture) + sizeof(ss.cancelPresentCapture) &&
+				ss.armPresentCapture && ss.consumePresentCapture && ss.cancelPresentCapture;
 		}
 
 		static void ExtractAudioTrackInfo(const GakuMotionClockSnapshotV1& snap, AudioTrackInfo& out)
@@ -872,6 +1029,286 @@ namespace VideoExporter
 			out.audioSpeed = (std::isfinite(snap.audioSpeed) && snap.audioSpeed > 0.0f) ? snap.audioSpeed : 1.0;
 			out.playbackSpeed = (std::isfinite(snap.playbackSpeed) && snap.playbackSpeed > 0.0f) ? snap.playbackSpeed : 1.0;
 			out.musicVolume = std::isfinite(snap.musicVolume) ? snap.musicVolume : 1.0f;
+		}
+
+		bool EvaluateLockstepGate(const GakuMotionClockServiceV1& clk, uint64_t leaseId,
+			bool isLockstep, uint64_t lastSerial, bool& sawPlaying, uint64_t targetFrames,
+			std::chrono::steady_clock::time_point captureStart, GakuMotionClockSnapshotV1& outSnap)
+		{
+			outSnap = {};
+			outSnap.abiVersion = GAKU_MOTION_CLOCK_VERSION;
+			outSnap.structSize = sizeof(outSnap);
+			if (!isLockstep) return true;
+
+			const uint64_t curCaptured = capturedFrames_.load(std::memory_order_acquire);
+			if (targetFrames > 0 && curCaptured >= targetFrames)
+			{
+				FinishRecordingCapture(false, false, "");
+				return false;
+			}
+			if (clk.getSnapshot(clk.context, &outSnap) != GAKU_OK)
+			{
+				FinishRecordingCapture(true, true, "无法读取 GakuMotion 时钟快照");
+				return false;
+			}
+			if (outSnap.leaseId != leaseId)
+			{
+				FinishRecordingCapture(true, true, "GakuMotion 录制锁已丢失");
+				return false;
+			}
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				if (audioInfo_.audioFilePath.empty() && outSnap.audioFilePath[0] != '\0')
+				{
+					ExtractAudioTrackInfo(outSnap, audioInfo_);
+				}
+			}
+			if (outSnap.playbackState != 0)
+			{
+				sawPlaying = true;
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				sawClockPlaying_ = true;
+			}
+			else if (sawPlaying)
+			{
+				FinishRecordingCapture(false, false, "");
+				return false;
+			}
+			if (outSnap.evaluatedFrameSerial == lastSerial)
+			{
+				if (capturedFrames_.load(std::memory_order_acquire) == 0 &&
+					std::chrono::steady_clock::now() - captureStart > std::chrono::seconds(8))
+				{
+					FinishRecordingCapture(true, true, "等待 GakuMotion 首帧姿态或进入录制播放状态超时");
+				}
+				return false;
+			}
+			return true;
+		}
+
+		bool AcquireFreeRingSlot(bool isLockstep, size_t& outWriteIndex)
+		{
+			std::unique_lock<std::mutex> ringLock(ringMutex_);
+			if (ringCount_ == kRingSlots)
+			{
+				if (isLockstep)
+				{
+					ringLock.unlock();
+					std::lock_guard<std::mutex> stLock(stateMutex_);
+					++ringOverflowStalls_;
+					return false;
+				}
+				ringNotFullCv_.wait_for(ringLock, std::chrono::milliseconds(50), [&]() {
+					return ringCount_ < kRingSlots || writerStopRequested_ || writerError_.load(std::memory_order_acquire);
+				});
+				if (ringCount_ == kRingSlots || writerStopRequested_)
+				{
+					ringLock.unlock();
+					std::lock_guard<std::mutex> stLock(stateMutex_);
+					++ringOverflowStalls_;
+					return false;
+				}
+			}
+			outWriteIndex = ringWriteIdx_;
+			return true;
+		}
+
+		bool CommitCapturedFrame(size_t writeIndex, const RecorderConfig& cfg,
+			const GakuScreenshotFrameInfoV1& info, bool isLockstep,
+			const GakuMotionClockServiceV1& clk, uint64_t leaseId, uint64_t targetFrames,
+			uint64_t serialForCommit)
+		{
+			const uint32_t expectedRowBytes = cfg.width * 4u;
+			FrameSlot& slot = ringSlots_[writeIndex];
+			if (info.width != cfg.width || info.height != cfg.height || info.rowPitch < expectedRowBytes ||
+				static_cast<size_t>(info.rowPitch) * static_cast<size_t>(info.height) > slot.data.size())
+			{
+				FinishRecordingCapture(true, true, "ScreenshotManager 返回了不匹配的帧尺寸或步幅");
+				return false;
+			}
+			slot.width = info.width;
+			slot.height = info.height;
+			slot.rowPitch = info.rowPitch;
+
+			{
+				std::lock_guard<std::mutex> ringLock(ringMutex_);
+				ringWriteIdx_ = (ringWriteIdx_ + 1) % kRingSlots;
+				++ringCount_;
+			}
+			ringNotEmptyCv_.notify_one();
+
+			const uint64_t newCount = capturedFrames_.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (info.unityFrame != 0)
+			{
+				bool warnSameFrame = false;
+				{
+					std::lock_guard<std::mutex> lock(stateMutex_);
+					if (hasCapturedUnityFrame_ && info.unityFrame == lastCapturedUnityFrame_)
+					{
+						++sameUnityFrameCaptures_;
+						warnSameFrame = (sameUnityFrameCaptures_ == 1);
+					}
+					lastCapturedUnityFrame_ = info.unityFrame;
+					hasCapturedUnityFrame_ = true;
+				}
+				if (warnSameFrame)
+				{
+					Log(GAKU_LOG_WARNING,
+						"[VideoExporter] Duplicate unityFrame observed during capture (frame=" +
+						std::to_string(info.unityFrame) + ")");
+				}
+			}
+			if (isLockstep)
+			{
+				{
+					std::lock_guard<std::mutex> lock(stateMutex_);
+					lastCapturedSerial_ = serialForCommit;
+				}
+				const GakuStatus notifySt = clk.notifyFrameRendered(clk.context, leaseId, serialForCommit, 1u);
+				if (notifySt != GAKU_OK && !notifyErrorLogged_)
+				{
+					notifyErrorLogged_ = true;
+					Log(GAKU_LOG_WARNING,
+						"[VideoExporter] notifyFrameRendered returned status=" + std::to_string(notifySt) +
+						" (serial=" + std::to_string(serialForCommit) + ")");
+				}
+				if (targetFrames > 0 && newCount >= targetFrames)
+				{
+					FinishRecordingCapture(false, false, "");
+				}
+			}
+			return true;
+		}
+
+		// Returns true when caller may proceed (no pending frame still blocking this frame).
+		bool PollPendingPresentCapture(bool fromAfterRender)
+		{
+			RecorderConfig cfg;
+			GakuScreenshotServiceV1 ss{};
+			GakuMotionClockServiceV1 clk{};
+			bool isLockstep = false;
+			uint64_t leaseId = 0;
+			uint64_t targetFrames = 0;
+			uint64_t token = 0;
+			uint64_t poseSerial = 0;
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				if (phase_ != RecorderPhase::Recording || !usePresentPath_) return true;
+				if (awaitingPresentToken_ == 0) return true;
+				cfg = sessionConfig_;
+				ss = screenshot_;
+				clk = clock_;
+				isLockstep = activeLockstep_;
+				leaseId = leaseId_;
+				targetFrames = targetFrames_;
+				token = awaitingPresentToken_;
+				poseSerial = awaitingPresentPoseSerial_;
+			}
+
+			size_t writeIndex = 0;
+			if (!AcquireFreeRingSlot(isLockstep, writeIndex)) return false;
+
+			FrameSlot& slot = ringSlots_[writeIndex];
+			GakuScreenshotFrameInfoV1 info{};
+			info.abiVersion = GAKU_SCREENSHOT_VERSION;
+			info.structSize = sizeof(info);
+			uint64_t gotToken = 0;
+			char errBuf[256]{};
+			const GakuStatus st = ss.consumePresentCapture(
+				ss.context, &gotToken, slot.data.data(), slot.data.size(), &info, errBuf, sizeof(errBuf));
+			if (st != GAKU_OK)
+			{
+				{
+					std::lock_guard<std::mutex> lock(stateMutex_);
+					usePresentPath_ = false;
+					awaitingPresentToken_ = 0;
+				}
+				Log(GAKU_LOG_WARNING,
+					std::string("[VideoExporter] Swapchain Present capture unavailable (") +
+					(errBuf[0] ? errBuf : std::to_string(st)) + "); falling back to offscreen camera render.");
+				return true;
+			}
+			if (gotToken == 0)
+			{
+				return false; // Still awaiting Present; do not arm next frame yet.
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				awaitingPresentToken_ = 0;
+			}
+
+			uint64_t commitSerial = poseSerial;
+			if (isLockstep && clk.getSnapshot)
+			{
+				GakuMotionClockSnapshotV1 curSnap{};
+				curSnap.abiVersion = GAKU_MOTION_CLOCK_VERSION;
+				curSnap.structSize = sizeof(curSnap);
+				if (clk.getSnapshot(clk.context, &curSnap) == GAKU_OK && curSnap.evaluatedFrameSerial != 0)
+					commitSerial = curSnap.evaluatedFrameSerial;
+			}
+			CommitCapturedFrame(writeIndex, cfg, info, isLockstep, clk, leaseId, targetFrames, commitSerial);
+			// If consumed in OnEndOfFrameCapture, wait for the next MotionActorTick + render before arming again.
+			return !fromAfterRender;
+		}
+
+		void TryArmPresentCapture()
+		{
+			RecorderConfig cfg;
+			GakuScreenshotServiceV1 ss{};
+			GakuMotionClockServiceV1 clk{};
+			bool isLockstep = false;
+			uint64_t leaseId = 0;
+			uint64_t targetFrames = 0;
+			uint64_t lastSerial = 0;
+			bool sawPlaying = false;
+			std::chrono::steady_clock::time_point captureStart{};
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				if (phase_ != RecorderPhase::Recording || !usePresentPath_ || awaitingPresentToken_ != 0)
+					return;
+				cfg = sessionConfig_;
+				ss = screenshot_;
+				clk = clock_;
+				isLockstep = activeLockstep_;
+				leaseId = leaseId_;
+				targetFrames = targetFrames_;
+				lastSerial = lastCapturedSerial_;
+				sawPlaying = sawClockPlaying_;
+				captureStart = captureStartTime_;
+			}
+
+			GakuMotionClockSnapshotV1 snap{};
+			if (!EvaluateLockstepGate(clk, leaseId, isLockstep, lastSerial, sawPlaying, targetFrames, captureStart, snap))
+				return;
+
+			size_t unusedWriteIdx = 0;
+			if (!AcquireFreeRingSlot(isLockstep, unusedWriteIdx)) return;
+
+			uint64_t nextToken = 0;
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				nextToken = nextPresentToken_++;
+			}
+			const GakuStatus armSt = ss.armPresentCapture(
+				ss.context, nextToken, cfg.width, cfg.height, GAKU_PIXEL_RGBA8_SRGB_TOPDOWN);
+			if (armSt == GAKU_OK)
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				awaitingPresentToken_ = nextToken;
+				awaitingPresentPoseSerial_ = snap.evaluatedFrameSerial;
+				return;
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(stateMutex_);
+				usePresentPath_ = false;
+				awaitingPresentToken_ = 0;
+			}
+			Log(GAKU_LOG_WARNING,
+				"[VideoExporter] armPresentCapture unavailable (status=" + std::to_string(armSt) +
+				"); falling back to offscreen camera render.");
+			TickActiveRecording();
 		}
 
 		void TickActiveRecording()
@@ -911,88 +1348,15 @@ namespace VideoExporter
 			}
 
 			GakuMotionClockSnapshotV1 snap{};
-			snap.abiVersion = GAKU_MOTION_CLOCK_VERSION;
-			snap.structSize = sizeof(snap);
-
-			if (isLockstep)
+			if (!EvaluateLockstepGate(clk, leaseId, isLockstep, lastSerial, sawPlaying, targetFrames, captureStart, snap))
 			{
-				const uint64_t curCaptured = capturedFrames_.load(std::memory_order_acquire);
-				if (targetFrames > 0 && curCaptured >= targetFrames)
-				{
-					FinishRecordingCapture(false, false, "");
-					return;
-				}
-				if (clk.getSnapshot(clk.context, &snap) != GAKU_OK)
-				{
-					FinishRecordingCapture(true, true, "无法读取 GakuMotion 时钟快照");
-					return;
-				}
-				if (snap.leaseId != leaseId)
-				{
-					FinishRecordingCapture(true, true, "GakuMotion 录制锁已丢失");
-					return;
-				}
-				{
-					std::lock_guard<std::mutex> lock(stateMutex_);
-					if (audioInfo_.audioFilePath.empty() && snap.audioFilePath[0] != '\0')
-					{
-						ExtractAudioTrackInfo(snap, audioInfo_);
-					}
-				}
-				if (snap.playbackState != 0)
-				{
-					sawPlaying = true;
-					std::lock_guard<std::mutex> lock(stateMutex_);
-					sawClockPlaying_ = true;
-				}
-				else if (sawPlaying)
-				{
-					FinishRecordingCapture(false, false, "");
-					return;
-				}
-				else if (snap.evaluatedFrameSerial == lastSerial)
-				{
-					const auto waited = std::chrono::steady_clock::now() - captureStart;
-					if (waited > std::chrono::seconds(8))
-					{
-						FinishRecordingCapture(true, true, "等待 GakuMotion 进入录制播放状态超时");
-					}
-					return;
-				}
-
-				if (snap.evaluatedFrameSerial == lastSerial)
-				{
-					// Same frame already captured; wait cleanly.
-					return;
-				}
+				return;
 			}
 
-			// Acquire a free slot from the 4-slot ring buffer.
 			size_t writeIndex = 0;
+			if (!AcquireFreeRingSlot(isLockstep, writeIndex))
 			{
-				std::unique_lock<std::mutex> ringLock(ringMutex_);
-				if (ringCount_ == kRingSlots)
-				{
-					if (isLockstep)
-					{
-						// Backpressure: hold without calling notifyFrameRendered so GakuMotion does not advance!
-						ringLock.unlock();
-						std::lock_guard<std::mutex> stLock(stateMutex_);
-						++ringOverflowStalls_;
-						return;
-					}
-					ringNotFullCv_.wait_for(ringLock, std::chrono::milliseconds(50), [&]() {
-						return ringCount_ < kRingSlots || writerStopRequested_ || writerError_.load(std::memory_order_acquire);
-					});
-					if (ringCount_ == kRingSlots || writerStopRequested_)
-					{
-						ringLock.unlock();
-						std::lock_guard<std::mutex> stLock(stateMutex_);
-						++ringOverflowStalls_;
-						return;
-					}
-				}
-				writeIndex = ringWriteIdx_;
+				return;
 			}
 
 			FrameSlot& slot = ringSlots_[writeIndex];
@@ -1018,37 +1382,7 @@ namespace VideoExporter
 				FinishRecordingCapture(true, true, detail);
 				return;
 			}
-			const uint32_t expectedRowBytes = cfg.width * 4u;
-			if (info.width != cfg.width || info.height != cfg.height || info.rowPitch < expectedRowBytes ||
-				static_cast<size_t>(info.rowPitch) * static_cast<size_t>(info.height) > slot.data.size())
-			{
-				FinishRecordingCapture(true, true, "ScreenshotManager 返回了不匹配的帧尺寸或步幅");
-				return;
-			}
-			slot.width = info.width;
-			slot.height = info.height;
-			slot.rowPitch = info.rowPitch;
-
-			{
-				std::lock_guard<std::mutex> ringLock(ringMutex_);
-				ringWriteIdx_ = (ringWriteIdx_ + 1) % kRingSlots;
-				++ringCount_;
-			}
-			ringNotEmptyCv_.notify_one();
-
-			const uint64_t newCount = capturedFrames_.fetch_add(1, std::memory_order_acq_rel) + 1;
-			if (isLockstep)
-			{
-				{
-					std::lock_guard<std::mutex> lock(stateMutex_);
-					lastCapturedSerial_ = snap.evaluatedFrameSerial;
-				}
-				clk.notifyFrameRendered(clk.context, leaseId, snap.evaluatedFrameSerial, 1u);
-				if (targetFrames > 0 && newCount >= targetFrames)
-				{
-					FinishRecordingCapture(false, false, "");
-				}
-			}
+			CommitCapturedFrame(writeIndex, cfg, info, isLockstep, clk, leaseId, targetFrames, snap.evaluatedFrameSerial);
 		}
 
 		void WriterLoop()
@@ -1124,6 +1458,14 @@ namespace VideoExporter
 			{
 				std::lock_guard<std::mutex> lock(stateMutex_);
 				if (phase_ != RecorderPhase::Recording) return;
+
+				if (HasPresentCaptureApi(screenshot_) && awaitingPresentToken_ != 0)
+				{
+					screenshot_.cancelPresentCapture(screenshot_.context);
+				}
+				usePresentPath_ = false;
+				awaitingPresentToken_ = 0;
+				awaitingPresentPoseSerial_ = 0;
 
 				if (leaseHeld_)
 				{
@@ -1288,10 +1630,22 @@ namespace VideoExporter
 		FfmpegProbeResult sessionProbe_;
 		GakuScreenshotServiceV1 screenshot_{};
 		GakuMotionClockServiceV1 clock_{};
+		static constexpr uint64_t kMaxTicksWithoutEndOfFrame = 4;
+		std::atomic<bool> deferredCaptureMode_{false};
+		uint64_t ticksWithoutEndOfFrame_{0};
+		bool deferredFallbackLogged_{false};
+		bool notifyErrorLogged_{false};
 		bool activeLockstep_{false};
 		uint64_t leaseId_{0};
 		bool leaseHeld_{false};
 		uint64_t lastCapturedSerial_{0};
+		bool hasCapturedUnityFrame_{false};
+		uint64_t lastCapturedUnityFrame_{0};
+		uint64_t sameUnityFrameCaptures_{0};
+		std::atomic<bool> usePresentPath_{false};
+		uint64_t awaitingPresentToken_{0};
+		uint64_t awaitingPresentPoseSerial_{0};
+		uint64_t nextPresentToken_{1};
 		bool sawClockPlaying_{false};
 		uint64_t targetFrames_{0};
 		uint64_t ringOverflowStalls_{0};

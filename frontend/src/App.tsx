@@ -222,25 +222,25 @@ export function App() {
 
   if (!connected) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-4 p-6 text-muted-foreground">
+      <div className="flex h-full min-h-full w-full flex-col items-center justify-center gap-4 bg-background p-6 text-muted-foreground">
         {connectionError ? (
           <div className="flex max-w-md flex-col items-center gap-3 rounded-xl border bg-card/90 p-6 text-center shadow-sm">
             <div className="flex size-11 items-center justify-center rounded-full bg-destructive/15 text-destructive">
               <PlugZap className="size-5" />
             </div>
             <div className="space-y-1">
-              <p className="text-sm font-medium text-foreground">VideoExporter 原生桥接不可用</p>
-              <p className="text-xs leading-relaxed text-muted-foreground">{connectionError}</p>
+              <p className="text-gaku-md font-medium text-foreground">VideoExporter 原生桥接不可用</p>
+              <p className="text-gaku-xs leading-relaxed text-muted-foreground">{connectionError}</p>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={() => void videoExporterStore.connect()}>
-              <RefreshCw className="size-3.5" />
+              <RefreshCw className="size-4" />
               重新连接
             </Button>
           </div>
         ) : (
           <div className="flex flex-col items-center gap-2.5">
             <Loader2 className="size-7 animate-spin text-primary" />
-            <p className="text-sm">{connecting ? '正在连接 VideoExporter…' : '正在初始化…'}</p>
+            <p className="text-gaku-base">{connecting ? '正在连接 VideoExporter…' : '正在初始化…'}</p>
           </div>
         )}
       </div>
@@ -255,31 +255,31 @@ export function App() {
         : 0
 
   return (
-    <div className="flex h-full flex-col overflow-hidden bg-background text-foreground">
+    <div className="flex h-full min-h-full w-full flex-col overflow-hidden bg-background text-foreground">
       {/* Top Header & Service Status Badges */}
-      <header className="shrink-0 border-b bg-card/80 px-4 py-3 backdrop-blur-sm">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2.5">
-            <div className="flex size-8 items-center justify-center rounded-lg bg-primary/15 text-primary">
-              <Film className="size-4" />
+      <header className="w-full shrink-0 border-b bg-card/80 px-5 py-3.5 backdrop-blur-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex size-10 items-center justify-center rounded-lg bg-primary/15 text-primary">
+              <Film className="size-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-sm font-semibold tracking-tight">VideoExporter</h1>
-                <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="text-gaku-title font-semibold leading-tight tracking-tight">VideoExporter</h1>
+                <span className="rounded bg-muted px-2 py-0.5 font-mono text-gaku-micro text-muted-foreground">
                   v0.1.0
                 </span>
                 <Badge variant={phaseBadgeVariant(status.phase)} data-testid="phase-badge">
                   {phaseLabel(status.phase)}
                 </Badge>
               </div>
-              <p className="text-xs text-muted-foreground">
+              <p className="mt-1 text-gaku-xs text-muted-foreground">
                 4K 锁步视频录制与 FFmpeg 后期合成管线
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
               variant="outline"
@@ -287,30 +287,28 @@ export function App() {
               disabled={busy}
               onClick={() => void videoExporterStore.refreshState()}
             >
-              <RefreshCw className="size-3.5" />
+              <RefreshCw className="size-4" />
               刷新状态
             </Button>
             {status.recording ? (
               <Button
                 type="button"
                 variant="destructive"
-                size="sm"
                 data-testid="toggle-recording-btn"
                 onClick={() => void videoExporterStore.stopRecording()}
               >
-                <Square className="size-3.5" />
+                <Square className="size-4" />
                 停止录制 (F12)
               </Button>
             ) : (
               <Button
                 type="button"
                 variant="default"
-                size="sm"
                 disabled={!canStartRecording}
                 data-testid="toggle-recording-btn"
                 onClick={() => void videoExporterStore.startRecording()}
               >
-                <Video className="size-3.5" />
+                <Video className="size-4" />
                 开始录制 (F12)
               </Button>
             )}
@@ -318,7 +316,7 @@ export function App() {
         </div>
 
         {/* Service Status Badges Row */}
-        <div className="mt-2.5 flex flex-wrap items-center gap-1.5" data-testid="service-badges">
+        <div className="mt-3 flex flex-wrap items-center gap-2" data-testid="service-badges">
           <Badge
             variant={
               services.screenshot.available &&
@@ -366,95 +364,112 @@ export function App() {
           </Badge>
 
           {services.ffmpeg.available && (
-            <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-1.5 text-gaku-micro text-muted-foreground">
               {services.ffmpeg.encoders.h264_nvenc && (
-                <Badge variant={services.ffmpeg.nvencRuntimeVerified ? 'default' : 'outline'}>
+                <Badge variant={services.ffmpeg.nvencRuntimeVerified ? 'default' : 'outline'} className="text-gaku-micro">
                   NVENC
                 </Badge>
               )}
-              {services.ffmpeg.encoders.libx264 && <Badge variant="outline">x264</Badge>}
-              {services.ffmpeg.encoders.libx265 && <Badge variant="outline">x265</Badge>}
-              {services.ffmpeg.encoders.prores_ks && <Badge variant="outline">ProRes 4444</Badge>}
-              {services.ffmpeg.encoders['libvpx-vp9'] && <Badge variant="outline">VP9 Alpha</Badge>}
+              {services.ffmpeg.encoders.libx264 && (
+                <Badge variant="outline" className="text-gaku-micro">
+                  x264
+                </Badge>
+              )}
+              {services.ffmpeg.encoders.libx265 && (
+                <Badge variant="outline" className="text-gaku-micro">
+                  x265
+                </Badge>
+              )}
+              {services.ffmpeg.encoders.prores_ks && (
+                <Badge variant="outline" className="text-gaku-micro">
+                  ProRes 4444
+                </Badge>
+              )}
+              {services.ffmpeg.encoders['libvpx-vp9'] && (
+                <Badge variant="outline" className="text-gaku-micro">
+                  VP9 Alpha
+                </Badge>
+              )}
             </div>
           )}
         </div>
       </header>
 
       {/* Scrollable Main Workspace */}
-      <main className="flex-1 space-y-3 overflow-y-auto p-4">
+      <main className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {(actionError || status.lastError) && (
           <Alert variant="destructive" data-testid="error-alert">
             <AlertTitle>导出或操作提示</AlertTitle>
-            <AlertDescription>{actionError || status.lastError}</AlertDescription>
+            <AlertDescription className="break-words">{actionError || status.lastError}</AlertDescription>
           </Alert>
         )}
         {actionNotice && !actionError && (
           <Alert variant="info">
             <CheckCircle2 className="size-4" />
-            <AlertDescription>{actionNotice}</AlertDescription>
+            <AlertDescription className="break-words">{actionNotice}</AlertDescription>
           </Alert>
         )}
 
         {/* Live Progress HUD */}
         <Card data-testid="progress-hud">
-          <CardHeader className="pb-2">
-            <div className="flex items-center justify-between gap-2">
-              <CardTitle className="flex items-center gap-2 text-sm">
+          <CardHeader className="pb-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <CardTitle className="flex items-center gap-2 text-gaku-md">
                 <Gauge className="size-4 text-primary" />
                 实时录制与编码进度 HUD
               </CardTitle>
-              <span className="text-xs text-muted-foreground">{status.phaseMessage || phaseLabel(status.phase)}</span>
+              <span className="text-gaku-xs text-muted-foreground">{status.phaseMessage || phaseLabel(status.phase)}</span>
             </div>
           </CardHeader>
           <CardContent className="space-y-3">
             <Progress value={progressPct} />
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-              <div className="rounded-md border bg-surface/60 px-2.5 py-1.5">
-                <div className="text-[11px] text-muted-foreground">已捕获帧数</div>
-                <div className="font-mono text-sm font-semibold" data-testid="hud-captured">
+            <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
+              <div className="rounded-md border bg-surface/60 px-3 py-2">
+                <div className="text-gaku-xs text-muted-foreground">已捕获帧数</div>
+                <div className="font-mono text-gaku-base font-semibold" data-testid="hud-captured">
                   {status.capturedFrames}
                   {status.targetFrames > 0 ? ` / ${status.targetFrames}` : ''}
                 </div>
               </div>
-              <div className="rounded-md border bg-surface/60 px-2.5 py-1.5">
-                <div className="text-[11px] text-muted-foreground">已编码帧数</div>
-                <div className="font-mono text-sm font-semibold" data-testid="hud-encoded">
+              <div className="rounded-md border bg-surface/60 px-3 py-2">
+                <div className="text-gaku-xs text-muted-foreground">已编码帧数</div>
+                <div className="font-mono text-gaku-base font-semibold" data-testid="hud-encoded">
                   {status.encodedFrames}
                 </div>
               </div>
-              <div className="rounded-md border bg-surface/60 px-2.5 py-1.5">
-                <div className="text-[11px] text-muted-foreground">吞吐帧率</div>
-                <div className="font-mono text-sm font-semibold" data-testid="hud-fps">
+              <div className="rounded-md border bg-surface/60 px-3 py-2">
+                <div className="text-gaku-xs text-muted-foreground">吞吐帧率</div>
+                <div className="font-mono text-gaku-base font-semibold" data-testid="hud-fps">
                   {status.fps.toFixed(1)} fps
                 </div>
               </div>
-              <div className="rounded-md border bg-surface/60 px-2.5 py-1.5">
-                <div className="text-[11px] text-muted-foreground">已用耗时</div>
-                <div className="font-mono text-sm font-semibold" data-testid="hud-elapsed">
+              <div className="rounded-md border bg-surface/60 px-3 py-2">
+                <div className="text-gaku-xs text-muted-foreground">已用耗时</div>
+                <div className="font-mono text-gaku-base font-semibold" data-testid="hud-elapsed">
                   {formatDuration(status.elapsedSec)}
                 </div>
               </div>
-              <div className="rounded-md border bg-surface/60 px-2.5 py-1.5">
-                <div className="text-[11px] text-muted-foreground">当前阶段</div>
-                <div className="truncate text-sm font-semibold" data-testid="hud-phase">
+              <div className="rounded-md border bg-surface/60 px-3 py-2">
+                <div className="text-gaku-xs text-muted-foreground">当前阶段</div>
+                <div className="truncate text-gaku-base font-semibold" data-testid="hud-phase">
                   {phaseLabel(status.phase)}
                 </div>
               </div>
             </div>
 
             {status.lastOutputPath && (
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
-                <div className="min-w-0 flex-1 truncate font-mono" title={status.lastOutputPath} data-testid="hud-output-path">
+              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-md border bg-muted/40 px-3 py-2.5 text-gaku-xs">
+                <div className="min-w-0 flex-1 break-all font-mono text-foreground" title={status.lastOutputPath} data-testid="hud-output-path">
                   最近导出: {status.lastOutputPath}
                 </div>
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
+                  className="shrink-0"
                   onClick={() => void videoExporterStore.openFolder(true)}
                 >
-                  <FolderOpen className="size-3.5" />
+                  <FolderOpen className="size-4" />
                   定位文件
                 </Button>
               </div>
@@ -463,17 +478,17 @@ export function App() {
         </Card>
 
         {/* Two-column settings grid */}
-        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           {/* Resolution, FPS & Recording Scope */}
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-sm">
+              <CardTitle className="flex items-center gap-2 text-gaku-md">
                 <SlidersHorizontal className="size-4 text-primary" />
                 画面规格与录制范围
               </CardTitle>
               <CardDescription>最高支持 4K (3840×2160 / 竖屏 2160×3840) 与零丢帧锁步时钟</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-3">
+            <CardContent className="space-y-3.5">
               <div className="space-y-1.5">
                 <Label htmlFor="resolution-preset">分辨率预设</Label>
                 <Select
@@ -500,8 +515,8 @@ export function App() {
                 </Select>
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1">
+              <div className="grid grid-cols-2 gap-2.5">
+                <div className="space-y-1.5">
                   <Label htmlFor="custom-width">宽度 (px)</Label>
                   <Input
                     id="custom-width"
@@ -510,13 +525,14 @@ export function App() {
                     max={4096}
                     step={2}
                     disabled={busy}
+                    className="font-mono"
                     value={customWidthText}
                     onChange={(e) => setCustomWidthText(e.target.value)}
                     onBlur={commitCustomResolution}
                     onKeyDown={(e) => e.key === 'Enter' && commitCustomResolution()}
                   />
                 </div>
-                <div className="space-y-1">
+                <div className="space-y-1.5">
                   <Label htmlFor="custom-height">高度 (px)</Label>
                   <Input
                     id="custom-height"
@@ -525,6 +541,7 @@ export function App() {
                     max={4096}
                     step={2}
                     disabled={busy}
+                    className="font-mono"
                     value={customHeightText}
                     onChange={(e) => setCustomHeightText(e.target.value)}
                     onBlur={commitCustomResolution}
@@ -535,7 +552,7 @@ export function App() {
 
               <div className="space-y-1.5">
                 <Label>输出帧率 (FPS)</Label>
-                <div className="grid grid-cols-4 gap-1.5">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                   {FPS_PRESETS.map((fps) => (
                     <Button
                       key={fps}
@@ -574,8 +591,8 @@ export function App() {
               </div>
 
               {config.recordingMode === 'lockstep_range' && (
-                <div className="grid grid-cols-2 gap-2 rounded-md border bg-muted/30 p-2.5">
-                  <div className="space-y-1">
+                <div className="grid grid-cols-2 gap-2.5 rounded-md border bg-muted/30 p-3">
+                  <div className="space-y-1.5">
                     <Label htmlFor="range-start">开始时间 (秒)</Label>
                     <Input
                       id="range-start"
@@ -583,13 +600,14 @@ export function App() {
                       min={0}
                       step={0.1}
                       disabled={busy}
+                      className="font-mono"
                       value={rangeStartText}
                       onChange={(e) => setRangeStartText(e.target.value)}
                       onBlur={commitRange}
                       onKeyDown={(e) => e.key === 'Enter' && commitRange()}
                     />
                   </div>
-                  <div className="space-y-1">
+                  <div className="space-y-1.5">
                     <Label htmlFor="range-end">结束时间 (秒)</Label>
                     <Input
                       id="range-end"
@@ -597,6 +615,7 @@ export function App() {
                       min={0.1}
                       step={0.1}
                       disabled={busy}
+                      className="font-mono"
                       value={rangeEndText}
                       onChange={(e) => setRangeEndText(e.target.value)}
                       onBlur={commitRange}
@@ -611,13 +630,13 @@ export function App() {
           {/* Video Codec, Alpha & Quality */}
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-sm">
+              <CardTitle className="flex items-center gap-2 text-gaku-md">
                 <Sparkles className="size-4 text-primary" />
                 视频编码与绿幕 Alpha 透明
               </CardTitle>
               <CardDescription>支持 MP4 H.264/HEVC 与 ProRes 4444 / VP9 透明通道导出</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-3">
+            <CardContent className="space-y-3.5">
               <div className="space-y-1.5">
                 <Label htmlFor="video-codec">输出格式与编码器</Label>
                 <Select
@@ -641,7 +660,7 @@ export function App() {
               </div>
 
               {alphaSelected ? (
-                <div className="space-y-1.5 rounded-md border border-primary/30 bg-primary/5 p-2.5">
+                <div className="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
                   <Label htmlFor="alpha-mode">透明通道采集模式</Label>
                   <Select
                     value={config.alphaMode}
@@ -659,7 +678,7 @@ export function App() {
                       <SelectItem value="opaque">关闭透明 (仅不透明像素)</SelectItem>
                     </SelectContent>
                   </Select>
-                  <p className="text-[11px] text-muted-foreground">
+                  <p className="text-gaku-xs leading-relaxed text-muted-foreground">
                     {config.codec === 'prores_ks'
                       ? '将使用 ProRes 4444 (yuva444p10le) 输出 .mov 透明视频，适合剪辑软件直接叠加。'
                       : '将使用 VP9 (yuva420p) 输出 .webm 透明视频，体积轻量。'}
@@ -689,24 +708,26 @@ export function App() {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <Label>画质系数 (CRF / CQ)</Label>
-                  <span className="font-mono text-xs text-muted-foreground">
+                  <span className="font-mono text-gaku-sm text-muted-foreground">
                     {config.crf} ({config.crf <= 16 ? '极高画质' : config.crf <= 20 ? '推荐均衡' : '高压缩'})
                   </span>
                 </div>
-                <Slider
-                  aria-label="画质系数 CRF"
-                  min={14}
-                  max={28}
-                  step={1}
-                  disabled={busy}
-                  value={[config.crf]}
-                  onValueCommit={(vals) => {
-                    if (vals[0] !== undefined) {
-                      void videoExporterStore.updateConfig({ crf: vals[0] })
-                    }
-                  }}
-                />
-                <div className="flex justify-between text-[11px] text-muted-foreground">
+                <div className="flex h-gaku-control items-center">
+                  <Slider
+                    aria-label="画质系数 CRF"
+                    min={14}
+                    max={28}
+                    step={1}
+                    disabled={busy}
+                    value={[config.crf]}
+                    onValueCommit={(vals) => {
+                      if (vals[0] !== undefined) {
+                        void videoExporterStore.updateConfig({ crf: vals[0] })
+                      }
+                    }}
+                  />
+                </div>
+                <div className="flex justify-between text-gaku-xs text-muted-foreground">
                   <span>14 (无损感)</span>
                   <span>21</span>
                   <span>28 (轻量)</span>
@@ -719,21 +740,21 @@ export function App() {
         {/* FFmpeg Post-Processing, Audio & Paths */}
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-sm">
+            <CardTitle className="flex items-center gap-2 text-gaku-md">
               <Wand2 className="size-4 text-primary" />
               FFmpeg 后期处理、音频混流与目录设置
             </CardTitle>
             <CardDescription>Stage B 自动混入 GakuAudio 舞台音效并执行可选视频滤镜</CardDescription>
           </CardHeader>
-          <CardContent className="space-y-3">
+          <CardContent className="space-y-3.5">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <div className="flex items-center justify-between rounded-md border bg-surface/50 px-3 py-2">
+              <div className="flex items-center justify-between gap-3 rounded-md border bg-surface/50 px-3.5 py-2.5">
                 <div className="space-y-0.5">
-                  <div className="flex items-center gap-1.5 text-sm font-medium">
-                    <Music2 className="size-3.5 text-primary" />
+                  <div className="flex items-center gap-1.5 text-gaku-base font-medium">
+                    <Music2 className="size-4 text-primary" />
                     混流曲目音频
                   </div>
-                  <p className="text-[11px] text-muted-foreground">自动从 GakuMotion 时钟读取音频轨与延迟偏移</p>
+                  <p className="text-gaku-xs leading-relaxed text-muted-foreground">自动从 GakuMotion 时钟读取音频轨与延迟偏移</p>
                 </div>
                 <Switch
                   aria-label="混流曲目音频"
@@ -743,10 +764,10 @@ export function App() {
                 />
               </div>
 
-              <div className="flex items-center justify-between rounded-md border bg-surface/50 px-3 py-2">
+              <div className="flex items-center justify-between gap-3 rounded-md border bg-surface/50 px-3.5 py-2.5">
                 <div className="space-y-0.5">
-                  <div className="text-sm font-medium">烘焙 GakuAudio 舞台音效</div>
-                  <p className="text-[11px] text-muted-foreground">导出 48kHz WAV 离线混响/空间 DSP 预设</p>
+                  <div className="text-gaku-base font-medium">烘焙 GakuAudio 舞台音效</div>
+                  <p className="text-gaku-xs leading-relaxed text-muted-foreground">导出 48kHz WAV 离线混响/空间 DSP 预设</p>
                 </div>
                 <Switch
                   aria-label="烘焙 GakuAudio 舞台音效"
@@ -788,6 +809,7 @@ export function App() {
                   id="extra-ffmpeg-args"
                   placeholder="例如: -metadata comment=Gakumas"
                   disabled={busy}
+                  className="font-mono"
                   value={extraArgsText}
                   onChange={(e) => setExtraArgsText(e.target.value)}
                   onBlur={() =>
@@ -809,6 +831,7 @@ export function App() {
                   id="custom-vf"
                   placeholder="例如: unsharp=5:5:0.8:5:5:0.0,eq=saturation=1.1"
                   disabled={busy}
+                  className="font-mono"
                   value={customVfText}
                   onChange={(e) => setCustomVfText(e.target.value)}
                   onBlur={() =>
@@ -825,14 +848,15 @@ export function App() {
 
             <Separator />
 
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="ffmpeg-path">FFmpeg 路径覆盖（留空则使用 PATH）</Label>
-                <div className="flex gap-1.5">
+                <div className="flex flex-wrap items-center gap-2">
                   <Input
                     id="ffmpeg-path"
                     placeholder="自动探测 PATH 中的 ffmpeg.exe"
                     disabled={busy}
+                    className="min-w-[180px] flex-1 font-mono"
                     value={ffmpegPathText}
                     onChange={(e) => setFfmpegPathText(e.target.value)}
                     onBlur={() =>
@@ -847,6 +871,7 @@ export function App() {
                     type="button"
                     variant="outline"
                     size="sm"
+                    className="shrink-0"
                     disabled={busy}
                     onClick={() => void videoExporterStore.browseFfmpeg()}
                   >
@@ -856,10 +881,11 @@ export function App() {
                     type="button"
                     variant="outline"
                     size="sm"
+                    className="shrink-0"
                     disabled={busy}
                     onClick={() => void videoExporterStore.probeFfmpeg(ffmpegPathText)}
                   >
-                    <Search className="size-3.5" />
+                    <Search className="size-4" />
                     探测
                   </Button>
                 </div>
@@ -867,10 +893,11 @@ export function App() {
 
               <div className="space-y-1.5">
                 <Label htmlFor="output-dir">视频输出目录</Label>
-                <div className="flex gap-1.5">
+                <div className="flex flex-wrap items-center gap-2">
                   <Input
                     id="output-dir"
                     disabled={busy}
+                    className="min-w-[180px] flex-1 font-mono"
                     value={outputDirText}
                     onChange={(e) => setOutputDirText(e.target.value)}
                     onBlur={() =>
@@ -886,9 +913,10 @@ export function App() {
                     type="button"
                     variant="outline"
                     size="sm"
+                    className="shrink-0"
                     onClick={() => void videoExporterStore.openFolder(false)}
                   >
-                    <HardDriveDownload className="size-3.5" />
+                    <HardDriveDownload className="size-4" />
                     打开文件夹
                   </Button>
                 </div>

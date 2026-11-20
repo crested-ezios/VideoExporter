@@ -1042,6 +1042,606 @@ namespace
 		desc.shutdown(pluginState);
 		FreeLibrary(mod);
 	}
+
+	void TestWakeControlDeduplicationAndDeferredEndOfFrameCapture()
+	{
+		TempDirGuard tmp(L"ve_deferred");
+		const auto probe = VideoExporter::FfmpegPipeline::Probe("");
+		EXPECT(probe.available && !probe.ffprobePath.empty());
+
+		// 1. ProcessPendingControl() + OnTick() in same TickFrame (freerun) must capture only 1 frame.
+		{
+			MockScreenshotState mockSs;
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [](GakuMotionClockServiceV1&) { return false; };
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.InitializePaths(tmp.dir / L"cfg_wake.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":320,"height":180,"fps":30,"recordingMode":"freerun","codec":"libx264","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"wake_dedup.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			// Simulate DrainTasks(MainThreadWakeTask -> ProcessPendingControl) followed immediately by OnTick.
+			rec.ProcessPendingControl();
+			EXPECT(rec.IsRecording());
+			EXPECT(rec.GetStatus().capturedFrames == 0);
+			rec.OnTick();
+			EXPECT(rec.GetStatus().capturedFrames == 1);
+
+			EXPECT(rec.RequestStop(err));
+			rec.ProcessPendingControl();
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			EXPECT(rec.GetStatus().phase == VideoExporter::RecorderPhase::Completed);
+		}
+
+		// 2. Deferred End-of-Frame Capture matches real GakuMotion contract:
+		//    - recordingBegin does NOT bump evaluatedFrameSerial;
+		//    - OnTick() never captures or steps clock before MotionActorTick;
+		//    - MotionActorTick evaluates pose and increments evaluatedFrameSerial;
+		//    - OnEndOfFrameCapture() captures that exact frame and calls notifyFrameRendered.
+		{
+			MockScreenshotState mockSs;
+			struct RealLikeClockState
+			{
+				uint64_t leaseId{0};
+				uint32_t playbackState{0};
+				uint64_t evaluatedSerial{100};
+				int64_t frameIndex{0};
+				double timeSeconds{0.0};
+				double durationSeconds{0.1}; // 30fps * 0.1s = 3 frames
+				std::vector<uint64_t> capturedSerials;
+				uint64_t notifyCount{0};
+
+				GakuMotionClockServiceV1 Service()
+				{
+					GakuMotionClockServiceV1 c{};
+					c.abiVersion = GAKU_MOTION_CLOCK_VERSION;
+					c.structSize = sizeof(c);
+					c.context = this;
+					c.getSnapshot = [](void* ctx, GakuMotionClockSnapshotV1* out) -> GakuStatus {
+						auto* st = static_cast<RealLikeClockState*>(ctx);
+						out->abiVersion = GAKU_MOTION_CLOCK_VERSION;
+						out->structSize = sizeof(*out);
+						out->runMode = st->leaseId ? GAKUMOTION_RUN_RECORDING : GAKUMOTION_RUN_REALTIME;
+						out->configuredSource = GAKUMOTION_CLOCK_EXTERNAL;
+						out->effectiveSource = GAKUMOTION_CLOCK_EXTERNAL;
+						out->playbackState = st->playbackState;
+						out->fpsNumerator = 30;
+						out->fpsDenominator = 1;
+						out->waitingForRenderComplete = 0; // Real GakuMotion external lease keeps this 0
+						out->currentTimeSeconds = st->timeSeconds;
+						out->timelineDurationSeconds = st->durationSeconds;
+						out->fixedFrameIndex = st->frameIndex;
+						out->leaseId = st->leaseId;
+						out->evaluatedFrameSerial = st->evaluatedSerial;
+						std::snprintf(out->trackTitle, sizeof(out->trackTitle), "RealLike");
+						return GAKU_OK;
+					};
+					c.acquireRecordingLease = [](void* ctx, const char*, uint32_t, uint32_t, uint64_t* outLease) -> GakuStatus {
+						auto* st = static_cast<RealLikeClockState*>(ctx);
+						st->leaseId = 77;
+						*outLease = 77;
+						return GAKU_OK;
+					};
+					c.releaseRecordingLease = [](void* ctx, uint64_t leaseId) -> GakuStatus {
+						auto* st = static_cast<RealLikeClockState*>(ctx);
+						if (st->leaseId != leaseId) return GAKU_E_CONFLICT;
+						st->leaseId = 0;
+						return GAKU_OK;
+					};
+					c.recordingBegin = [](void* ctx, uint64_t leaseId, double startSec) -> GakuStatus {
+						auto* st = static_cast<RealLikeClockState*>(ctx);
+						if (st->leaseId != leaseId) return GAKU_E_CONFLICT;
+						st->timeSeconds = startSec;
+						st->frameIndex = 0;
+						st->playbackState = 1;
+						// Note: real GakuMotion::RecordingBegin does NOT bump evaluatedFrameSerial!
+						return GAKU_OK;
+					};
+					c.recordingStop = [](void* ctx, uint64_t leaseId) -> GakuStatus {
+						auto* st = static_cast<RealLikeClockState*>(ctx);
+						if (st->leaseId != leaseId) return GAKU_E_CONFLICT;
+						st->playbackState = 0;
+						return GAKU_OK;
+					};
+					c.notifyFrameRendered = [](void* ctx, uint64_t leaseId, uint64_t serial, uint32_t advanceFrames) -> GakuStatus {
+						auto* st = static_cast<RealLikeClockState*>(ctx);
+						if (st->leaseId != leaseId || st->evaluatedSerial != serial) return GAKU_E_CONFLICT;
+						st->capturedSerials.push_back(serial);
+						++st->notifyCount;
+						st->frameIndex += advanceFrames;
+						st->timeSeconds += static_cast<double>(advanceFrames) / 30.0;
+						return GAKU_OK;
+					};
+					return c;
+				}
+			} mockClk;
+
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [&](GakuMotionClockServiceV1& out) { out = mockClk.Service(); return true; };
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.SetDeferredCaptureMode(true);
+			rec.InitializePaths(tmp.dir / L"cfg_def.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":320,"height":180,"fps":30,"recordingMode":"lockstep_full","codec":"libx264","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"deferred_eof.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			// Premature EndOfFrame before OnTick started session must do nothing
+			rec.OnEndOfFrameCapture();
+			EXPECT(mockSs.captureCount.load() == 0);
+
+			// Frame 0: OnTick starts session (does NOT capture), MotionActorTick evaluates frame 0, then OnEndOfFrameCapture captures.
+			rec.OnTick();
+			EXPECT(rec.IsRecording());
+			EXPECT(mockSs.captureCount.load() == 0);
+			EXPECT(mockClk.notifyCount == 0);
+
+			for (uint64_t f = 0; f < 3; ++f)
+			{
+				// Extra OnTick (e.g., WakeFramePump aliasing) must NEVER capture in deferred mode!
+				rec.OnTick();
+				EXPECT(mockSs.captureCount.load() == f);
+
+				// MotionActorTick evaluates frame f
+				++mockClk.evaluatedSerial;
+
+				// Extra OnEndOfFrameCapture without new serial after capture must skip
+				rec.OnEndOfFrameCapture();
+				EXPECT(mockSs.captureCount.load() == f + 1);
+				EXPECT(mockClk.notifyCount == f + 1);
+
+				if (f + 1 < 3)
+				{
+					rec.OnEndOfFrameCapture();
+					EXPECT(mockSs.captureCount.load() == f + 1);
+				}
+			}
+
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			const auto st = rec.GetStatus();
+			EXPECT(st.phase == VideoExporter::RecorderPhase::Completed);
+			EXPECT(st.capturedFrames == 3);
+			EXPECT(mockClk.leaseId == 0);
+			EXPECT(mockClk.capturedSerials.size() == 3);
+			EXPECT(mockClk.capturedSerials[0] == 101);
+			EXPECT(mockClk.capturedSerials[1] == 102);
+			EXPECT(mockClk.capturedSerials[2] == 103);
+		}
+	}
+
+	void TestSwapchainPresentPathAndFallback()
+	{
+		std::cout << "  [Test] Swapchain Present Path & Fallback...\n";
+		TempDirGuard tmp(L"ve_present_test");
+		const auto probe = VideoExporter::FfmpegPipeline::Probe("");
+		EXPECT(probe.available && !probe.ffprobePath.empty());
+
+		struct PresentMockScreenshot
+		{
+			uint64_t armedToken{0};
+			uint64_t readyToken{0};
+			uint64_t immediateCalls{0};
+			uint64_t presentConsumeCalls{0};
+			bool forcePresentUnavailableOnSecond{false};
+			uint64_t frameCounter{10};
+			uint8_t fillSeed{32};
+
+			GakuScreenshotServiceV1 Service()
+			{
+				GakuScreenshotServiceV1 s{};
+				s.abiVersion = GAKU_SCREENSHOT_VERSION;
+				s.structSize = sizeof(s);
+				s.context = this;
+				s.getCapabilities = [](void*, GakuScreenshotCapabilitiesV1* out) -> GakuStatus {
+					out->abiVersion = GAKU_SCREENSHOT_VERSION;
+					out->structSize = sizeof(*out);
+					out->runtimeReady = 1;
+					out->cameraAvailable = 1;
+					out->maxDimension = 4096;
+					out->windowWidth = 320;
+					out->windowHeight = 180;
+					return GAKU_OK;
+				};
+				s.captureFrameImmediate = [](void* ctx, const GakuScreenshotFrameRequestV1* req,
+					void* outPixels, size_t capacity, GakuScreenshotFrameInfoV1* outInfo, char*, uint32_t) -> GakuStatus {
+					auto* st = static_cast<PresentMockScreenshot*>(ctx);
+					++st->immediateCalls;
+					const size_t bytes = static_cast<size_t>(req->width) * req->height * 4u;
+					if (capacity < bytes) return GAKU_E_SIZE;
+					std::memset(outPixels, st->fillSeed++, bytes);
+					outInfo->width = req->width;
+					outInfo->height = req->height;
+					outInfo->rowPitch = req->width * 4u;
+					outInfo->hasAlpha = 0;
+					outInfo->unityFrame = ++st->frameCounter;
+					return GAKU_OK;
+				};
+				s.armPresentCapture = [](void* ctx, uint64_t token, uint32_t, uint32_t, uint32_t) -> GakuStatus {
+					auto* st = static_cast<PresentMockScreenshot*>(ctx);
+					st->armedToken = token;
+					return GAKU_OK;
+				};
+				s.consumePresentCapture = [](void* ctx, uint64_t* outToken, void* outPixels, size_t capacity,
+					GakuScreenshotFrameInfoV1* outInfo, char* errBuf, uint32_t errCap) -> GakuStatus {
+					auto* st = static_cast<PresentMockScreenshot*>(ctx);
+					if (st->forcePresentUnavailableOnSecond && st->presentConsumeCalls >= 1)
+					{
+						if (errBuf && errCap > 0) std::snprintf(errBuf, errCap, "Forced swapchain size mismatch");
+						return GAKU_E_UNAVAILABLE;
+					}
+					if (st->readyToken == 0)
+					{
+						*outToken = 0;
+						return GAKU_OK;
+					}
+					const size_t bytes = 320u * 180u * 4u;
+					if (capacity < bytes) return GAKU_E_SIZE;
+					std::memset(outPixels, st->fillSeed++, bytes);
+					outInfo->width = 320;
+					outInfo->height = 180;
+					outInfo->rowPitch = 320u * 4u;
+					outInfo->hasAlpha = 0;
+					outInfo->unityFrame = ++st->frameCounter;
+					*outToken = st->readyToken;
+					st->readyToken = 0;
+					++st->presentConsumeCalls;
+					return GAKU_OK;
+				};
+				s.cancelPresentCapture = [](void* ctx) -> GakuStatus {
+					auto* st = static_cast<PresentMockScreenshot*>(ctx);
+					st->armedToken = 0;
+					st->readyToken = 0;
+					return GAKU_OK;
+				};
+				return s;
+			}
+
+			void SimulatePresent()
+			{
+				if (armedToken != 0)
+				{
+					readyToken = armedToken;
+					armedToken = 0;
+				}
+			}
+		};
+
+		struct PresentMockClock
+		{
+			uint64_t leaseId{0};
+			uint32_t playbackState{0};
+			uint64_t evaluatedSerial{500};
+			uint64_t notifyCount{0};
+
+			GakuMotionClockServiceV1 Service()
+			{
+				GakuMotionClockServiceV1 c{};
+				c.abiVersion = GAKU_MOTION_CLOCK_VERSION;
+				c.structSize = sizeof(c);
+				c.context = this;
+				c.getSnapshot = [](void* ctx, GakuMotionClockSnapshotV1* out) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					out->abiVersion = GAKU_MOTION_CLOCK_VERSION;
+					out->structSize = sizeof(*out);
+					out->runMode = st->leaseId ? GAKUMOTION_RUN_RECORDING : GAKUMOTION_RUN_REALTIME;
+					out->playbackState = st->playbackState;
+					out->fpsNumerator = 30;
+					out->fpsDenominator = 1;
+					out->timelineDurationSeconds = 0.1; // 3 frames
+					out->leaseId = st->leaseId;
+					out->evaluatedFrameSerial = st->evaluatedSerial;
+					std::snprintf(out->trackTitle, sizeof(out->trackTitle), "PresentTrack");
+					return GAKU_OK;
+				};
+				c.acquireRecordingLease = [](void* ctx, const char*, uint32_t, uint32_t, uint64_t* outLease) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					st->leaseId = 91;
+					*outLease = 91;
+					return GAKU_OK;
+				};
+				c.releaseRecordingLease = [](void* ctx, uint64_t lease) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease) return GAKU_E_CONFLICT;
+					st->leaseId = 0;
+					return GAKU_OK;
+				};
+				c.recordingBegin = [](void* ctx, uint64_t lease, double) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease) return GAKU_E_CONFLICT;
+					st->playbackState = 1;
+					return GAKU_OK;
+				};
+				c.recordingStop = [](void* ctx, uint64_t lease) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease) return GAKU_E_CONFLICT;
+					st->playbackState = 0;
+					return GAKU_OK;
+				};
+				c.notifyFrameRendered = [](void* ctx, uint64_t lease, uint64_t, uint32_t) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease) return GAKU_E_CONFLICT;
+					++st->notifyCount;
+					return GAKU_OK;
+				};
+				return c;
+			}
+		};
+
+		// A. Pure Present capture path: 0 captureFrameImmediate calls, 3 Present frames.
+		{
+			PresentMockScreenshot mockSs;
+			PresentMockClock mockClk;
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [&](GakuMotionClockServiceV1& out) { out = mockClk.Service(); return true; };
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.SetDeferredCaptureMode(true);
+			rec.InitializePaths(tmp.dir / L"cfg_pres.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":320,"height":180,"fps":30,"recordingMode":"lockstep_full","codec":"libx264","alphaMode":"opaque","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"present_pure.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			rec.OnTick(); // Start session
+			EXPECT(rec.IsRecording());
+
+			for (int f = 0; f < 3; ++f)
+			{
+				++mockClk.evaluatedSerial; // MotionActorTick
+				rec.OnEndOfFrameCapture(); // Arm Present
+				EXPECT(mockSs.armedToken != 0);
+				mockSs.SimulatePresent(); // Swapchain Present copies backbuffer
+				rec.OnTick();             // Next frame OnTick consumes Present & steps clock
+			}
+
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			const auto st = rec.GetStatus();
+			EXPECT(st.phase == VideoExporter::RecorderPhase::Completed);
+			EXPECT(st.capturedFrames == 3);
+			EXPECT(mockSs.presentConsumeCalls == 3);
+			EXPECT(mockSs.immediateCalls == 0);
+			EXPECT(mockClk.notifyCount == 3);
+		}
+
+		// B. Mid-session swapchain failure seamlessly falls back to offscreen Camera.Render without aborting.
+		{
+			PresentMockScreenshot mockSs;
+			mockSs.forcePresentUnavailableOnSecond = true;
+			PresentMockClock mockClk;
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [&](GakuMotionClockServiceV1& out) { out = mockClk.Service(); return true; };
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.SetDeferredCaptureMode(true);
+			rec.InitializePaths(tmp.dir / L"cfg_fb.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":320,"height":180,"fps":30,"recordingMode":"lockstep_full","codec":"libx264","alphaMode":"opaque","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"present_fallback.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			rec.OnTick();
+			++mockClk.evaluatedSerial;
+			rec.OnEndOfFrameCapture(); // Arm frame 0
+			mockSs.SimulatePresent();
+			rec.OnTick(); // Consumes frame 0 via Present
+
+			++mockClk.evaluatedSerial;
+			rec.OnEndOfFrameCapture(); // Arms frame 1
+			mockSs.SimulatePresent();
+			rec.OnTick(); // Consume sees GAKU_E_UNAVAILABLE -> falls back cleanly without step
+			// Because fallback didn't consume frame 1, evaluatedSerial didn't need to advance yet:
+			rec.OnEndOfFrameCapture(); // Captures frame 1 immediately via captureFrameImmediate!
+			EXPECT(mockSs.immediateCalls == 1);
+
+			++mockClk.evaluatedSerial;
+			rec.OnEndOfFrameCapture(); // Captures frame 2 via captureFrameImmediate!
+			EXPECT(mockSs.immediateCalls == 2);
+
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			const auto st = rec.GetStatus();
+			EXPECT(st.phase == VideoExporter::RecorderPhase::Completed);
+			EXPECT(st.capturedFrames == 3);
+			EXPECT(mockSs.presentConsumeCalls == 1);
+			EXPECT(mockSs.immediateCalls == 2);
+		}
+
+		// C. When deferredCaptureMode is set but render-frame hook is unavailable (e.g. GakuVRify
+		//    hook conflict with all fallbacks failing), OnTick drives swapchain-present AND
+		//    refreshes evaluatedFrameSerial so strict GakuMotion NotifyFrameRendered never conflicts.
+		{
+			PresentMockScreenshot mockSs;
+			PresentMockClock mockClk;
+			auto strictClockService = [&]() {
+				GakuMotionClockServiceV1 c = mockClk.Service();
+				c.notifyFrameRendered = [](void* ctx, uint64_t lease, uint64_t serial, uint32_t) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease || st->evaluatedSerial != serial) return GAKU_E_CONFLICT;
+					++st->notifyCount;
+					return GAKU_OK;
+				};
+				return c;
+			};
+
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [&](GakuMotionClockServiceV1& out) { out = strictClockService(); return true; };
+			hostCb.isRenderFrameHookUnavailable = []() { return true; };
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.SetDeferredCaptureMode(true);
+			rec.InitializePaths(tmp.dir / L"cfg_unavail.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":320,"height":180,"fps":30,"recordingMode":"lockstep_full","codec":"libx264","alphaMode":"opaque","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"present_hook_unavail.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			// Frame 0: OnTick starts session + drops deferred mode; MotionActorTick(0) bumps serial.
+			rec.OnTick();
+			EXPECT(rec.IsRecording());
+			EXPECT(!rec.IsDeferredCaptureMode());
+			++mockClk.evaluatedSerial;
+
+			for (int f = 0; f < 3; ++f)
+			{
+				if (f > 0) ++mockClk.evaluatedSerial; // MotionActorTick evaluated next clock time
+				rec.OnTick(); // Arms Present on OnTick
+				EXPECT(mockSs.armedToken != 0);
+				++mockClk.evaluatedSerial; // MotionActorTick runs AFTER OnTick in same Unity frame
+				mockSs.SimulatePresent();  // Present completes at end of frame
+				rec.OnTick();              // Consumes Present & calls notifyFrameRendered with latest serial
+			}
+
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			const auto st = rec.GetStatus();
+			EXPECT(st.phase == VideoExporter::RecorderPhase::Completed);
+			EXPECT(st.capturedFrames == 3);
+			EXPECT(mockSs.presentConsumeCalls == 3);
+			EXPECT(mockSs.immediateCalls == 0);
+			EXPECT(mockClk.notifyCount == 3);
+		}
+
+		// D. Even if render-frame hook claimed active, silent OnEndOfFrameCapture falls back cleanly
+		//    after 4 ticks without hanging at 0 frames (swapchain-present).
+		{
+			PresentMockScreenshot mockSs;
+			PresentMockClock mockClk;
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [&](GakuMotionClockServiceV1& out) {
+				out = mockClk.Service();
+				out.notifyFrameRendered = [](void* ctx, uint64_t lease, uint64_t serial, uint32_t) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease || st->evaluatedSerial != serial) return GAKU_E_CONFLICT;
+					++st->notifyCount;
+					return GAKU_OK;
+				};
+				return true;
+			};
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.SetDeferredCaptureMode(true);
+			rec.InitializePaths(tmp.dir / L"cfg_silent_pres.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":320,"height":180,"fps":30,"recordingMode":"lockstep_full","codec":"libx264","alphaMode":"opaque","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"present_silent_fallback.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			rec.OnTick(); // Start session
+			++mockClk.evaluatedSerial;
+			for (int t = 0; t < 4; ++t)
+			{
+				rec.OnTick(); // Watchdog trips on tick 4 and arms Present!
+			}
+			EXPECT(!rec.IsDeferredCaptureMode());
+			EXPECT(mockSs.armedToken != 0);
+			++mockClk.evaluatedSerial;
+			mockSs.SimulatePresent();
+			rec.OnTick(); // Consumes frame 0
+
+			for (int f = 1; f < 3; ++f)
+			{
+				++mockClk.evaluatedSerial;
+				rec.OnTick();
+				EXPECT(mockSs.armedToken != 0);
+				++mockClk.evaluatedSerial;
+				mockSs.SimulatePresent();
+				rec.OnTick();
+			}
+
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			const auto st = rec.GetStatus();
+			EXPECT(st.phase == VideoExporter::RecorderPhase::Completed);
+			EXPECT(st.capturedFrames == 3);
+			EXPECT(mockSs.presentConsumeCalls == 3);
+			EXPECT(mockSs.immediateCalls == 0);
+			EXPECT(mockClk.notifyCount == 3);
+		}
+
+		// E. Silent OnEndOfFrameCapture with offscreen Camera.Render() (e.g. 4K / Green Screen Alpha)
+		//    also recovers cleanly via OnTick without hanging at 0 frames.
+		{
+			PresentMockScreenshot mockSs;
+			PresentMockClock mockClk;
+			VideoExporter::ServiceHostCallbacks hostCb;
+			hostCb.queryScreenshot = [&](GakuScreenshotServiceV1& out) { out = mockSs.Service(); return true; };
+			hostCb.queryClock = [&](GakuMotionClockServiceV1& out) {
+				out = mockClk.Service();
+				out.notifyFrameRendered = [](void* ctx, uint64_t lease, uint64_t serial, uint32_t) -> GakuStatus {
+					auto* st = static_cast<PresentMockClock*>(ctx);
+					if (st->leaseId != lease || st->evaluatedSerial != serial) return GAKU_E_CONFLICT;
+					++st->notifyCount;
+					return GAKU_OK;
+				};
+				return true;
+			};
+
+			VideoExporter::VideoRecorder rec(hostCb);
+			rec.SetDeferredCaptureMode(true);
+			rec.InitializePaths(tmp.dir / L"cfg_silent_off.json", VideoExporter::util::WideToUtf8(tmp.dir.wstring()));
+			GakuMotion::jsonlite::Value patch;
+			std::string err;
+			// 640x360 != window 320x180 -> offscreen Camera.Render path
+			EXPECT(GakuMotion::jsonlite::ParseText(
+				R"({"width":640,"height":360,"fps":30,"recordingMode":"lockstep_full","codec":"libx264","alphaMode":"force_transparent","muxAudio":false})",
+				patch, err));
+			EXPECT(rec.UpdateConfig(patch, err));
+			rec.SetOutputPathOverrideForTest(tmp.dir / L"offscreen_silent_fallback.mp4");
+			EXPECT(rec.RequestStart(err));
+
+			rec.OnTick(); // Start session
+			++mockClk.evaluatedSerial;
+			for (int t = 0; t < 4; ++t)
+			{
+				rec.OnTick(); // Watchdog trips on tick 4 and captures frame 0 immediately
+			}
+			EXPECT(!rec.IsDeferredCaptureMode());
+			EXPECT(mockSs.immediateCalls == 1);
+			for (int f = 1; f < 3; ++f)
+			{
+				++mockClk.evaluatedSerial;
+				rec.OnTick();
+			}
+
+			EXPECT(WaitForRecorderFinish(rec, 30000));
+			const auto st = rec.GetStatus();
+			EXPECT(st.phase == VideoExporter::RecorderPhase::Completed);
+			EXPECT(st.capturedFrames == 3);
+			EXPECT(mockSs.immediateCalls == 3);
+			EXPECT(mockSs.presentConsumeCalls == 0);
+			EXPECT(mockClk.notifyCount == 3);
+		}
+	}
 } // namespace
 
 int main()
@@ -1055,6 +1655,8 @@ int main()
 	TestLockstepSerialHoldAndFreeRun();
 	TestWebPanelBridgeContract();
 	TestPluginDllAbiAndLazyServices();
+	TestWakeControlDeduplicationAndDeferredEndOfFrameCapture();
+	TestSwapchainPresentPathAndFallback();
 
 	if (g_failures == 0)
 	{
