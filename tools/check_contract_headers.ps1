@@ -57,6 +57,17 @@ $failures = 0
 $checked = 0
 $skippedGroups = 0
 
+function Get-NormalizedHeaderHash([string]$Path) {
+    $text = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) -replace "`r`n", "`n"
+    $bytes = [Text.Encoding]::UTF8.GetBytes($text)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '')
+    } finally {
+        $sha.Dispose()
+    }
+}
+
 foreach ($group in $groups) {
     $siblingInclude = ''
     foreach ($candidate in $group.CandidateIncludes) {
@@ -94,8 +105,8 @@ foreach ($group in $groups) {
             continue
         }
 
-        $localHash = (Get-FileHash -LiteralPath $localFile -Algorithm SHA256).Hash
-        $siblingHash = (Get-FileHash -LiteralPath $siblingFile -Algorithm SHA256).Hash
+        $localHash = Get-NormalizedHeaderHash $localFile
+        $siblingHash = Get-NormalizedHeaderHash $siblingFile
         $checked++
         if ($localHash -ne $siblingHash) {
             Write-Host ("  DRIFT: {0} ({1})" -f $file, $group.Name) -ForegroundColor Red
