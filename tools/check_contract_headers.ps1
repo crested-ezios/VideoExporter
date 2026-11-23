@@ -20,7 +20,7 @@ $localInclude = Join-Path $RepoRoot 'include'
 $groups = @(
     @{
         Name = 'GakuLoader'
-        RelativeInclude = '..\..\GakuLoader\dev\include'
+        CandidateIncludes = @('..\..\GakuLoader\main\include', '..\..\GakuLoader\dev\include')
         Files = @(
             'GakuPlugin.h',
             'GakuPluginMetadata.h',
@@ -31,7 +31,7 @@ $groups = @(
     },
     @{
         Name = 'GakuMotion'
-        RelativeInclude = '..\..\GakuMotion\dev\include'
+        CandidateIncludes = @('..\..\GakuMotion\dev\include', '..\..\GakuMotion\main\include')
         Files = @(
             'GakuMotionClock.h',
             'GakuMotionStageState.h'
@@ -39,14 +39,14 @@ $groups = @(
     },
     @{
         Name = 'ScreenshotManager'
-        RelativeInclude = '..\..\ScreenshotManager\dev\include'
+        CandidateIncludes = @('..\..\ScreenshotManager\main\include', '..\..\ScreenshotManager\dev\include')
         Files = @(
             'GakuScreenshot.h'
         )
     },
     @{
         Name = 'GakuAudio'
-        RelativeInclude = '..\..\GakuAudio\dev\include'
+        CandidateIncludes = @('..\..\GakuAudio\main\include', '..\..\GakuAudio\dev\include')
         Files = @(
             'GakuAudio.h'
         )
@@ -58,9 +58,17 @@ $checked = 0
 $skippedGroups = 0
 
 foreach ($group in $groups) {
-    $siblingInclude = [IO.Path]::GetFullPath((Join-Path $RepoRoot $group.RelativeInclude))
-    if (-not (Test-Path -LiteralPath $siblingInclude -PathType Container)) {
-        Write-Host ("  SKIP: {0} checkout not found at {1}" -f $group.Name, $siblingInclude) -ForegroundColor Yellow
+    $siblingInclude = ''
+    foreach ($candidate in $group.CandidateIncludes) {
+        $resolved = [IO.Path]::GetFullPath((Join-Path $RepoRoot $candidate))
+        if (Test-Path -LiteralPath $resolved -PathType Container) {
+            $siblingInclude = $resolved
+            break
+        }
+    }
+    if (-not $siblingInclude) {
+        $fallbackDisplay = [IO.Path]::GetFullPath((Join-Path $RepoRoot $group.CandidateIncludes[0]))
+        Write-Host ("  SKIP: {0} checkout not found at {1}" -f $group.Name, $fallbackDisplay) -ForegroundColor Yellow
         $skippedGroups++
         foreach ($file in $group.Files) {
             $localFile = Join-Path $localInclude $file
