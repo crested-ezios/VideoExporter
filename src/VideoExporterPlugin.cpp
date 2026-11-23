@@ -9,6 +9,7 @@
 #include "../include/GakuMotionClock.h"
 #include "../include/GakuPaths.hpp"
 #include "../include/GakuPlugin.h"
+#include "../include/GakuPluginMetadata.h"
 #include "../include/GakuScreenshot.h"
 #include "../include/GakuWebPanel.h"
 
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,6 +28,23 @@
 
 namespace
 {
+	const char* const kPluginMaintainers[] = {
+		"crested-ezios",
+	};
+
+	const GakuPluginLocalizedTextV1 kPluginLocalizedSummaries[] = {
+		{"en", "4K lockstep video recorder and FFmpeg compositing plugin for GakuLoader."},
+		{"zh-Hans", "面向 GakuLoader 的 4K 锁步视频录制与 FFmpeg 后期合成插件。"},
+		{"zh-Hant", "面向 GakuLoader 的 4K 鎖步影片錄製與 FFmpeg 後期合成外掛。"},
+		{"ja", "GakuLoader 向けの 4K ロックステップ録画および FFmpeg 合成プラグイン。"},
+	};
+
+	const GakuPluginDependencyV1 kPluginDependencies[] = {
+		{"screenshotmanager", "ScreenshotManager", ">=0.1.0", GAKU_DEPENDENCY_REQUIRED, 0u},
+		{"gakumotion", "GakuMotion", ">=0.1.1", GAKU_DEPENDENCY_OPTIONAL, 0u},
+		{"gakuaudio", "GakuAudio", ">=0.1.0", GAKU_DEPENDENCY_OPTIONAL, 0u},
+	};
+
 	void ModuleAnchor() {}
 
 	std::wstring GetModuleDirectory()
@@ -56,11 +75,17 @@ namespace
 
 		std::mutex serviceCacheMutex;
 		bool hasScreenshot{false};
+		bool screenshotUnavailable{false};
 		GakuScreenshotServiceV1 screenshot{};
 		bool hasClock{false};
+		bool clockUnavailable{false};
 		GakuMotionClockServiceV1 clock{};
 		bool hasAudio{false};
+		bool audioUnavailable{false};
 		GakuAudioServiceV1 audio{};
+		uint8_t screenshotDiagLogged{0}; // 0=none, 1=active, 2=unavailable
+		uint8_t clockDiagLogged{0};
+		uint8_t audioDiagLogged{0};
 		bool hasRenderFrame{false};
 		GakuRenderFrameService renderFrame{};
 		bool renderFrameRegistered{false};
@@ -93,6 +118,7 @@ namespace
 			out = ctx->screenshot;
 			return true;
 		}
+		if (ctx->screenshotUnavailable) return false;
 		if (!ctx->host.queryService) return false;
 		GakuScreenshotServiceV1 tbl{};
 		const GakuStatus st = ctx->host.queryService(
@@ -118,6 +144,7 @@ namespace
 			out = ctx->clock;
 			return true;
 		}
+		if (ctx->clockUnavailable) return false;
 		if (!ctx->host.queryService) return false;
 		GakuMotionClockServiceV1 tbl{};
 		const GakuStatus st = ctx->host.queryService(
@@ -144,6 +171,7 @@ namespace
 			out = ctx->audio;
 			return true;
 		}
+		if (ctx->audioUnavailable) return false;
 		if (!ctx->host.queryService) return false;
 		GakuAudioServiceV1 tbl{};
 		const GakuStatus st = ctx->host.queryService(
@@ -157,6 +185,127 @@ namespace
 		ctx->hasAudio = true;
 		out = tbl;
 		return true;
+	}
+
+	bool IsUnavailablePluginState(GakuPluginLoadState state) noexcept
+	{
+		return state == GAKU_PLUGIN_STATE_NOT_FOUND ||
+			state == GAKU_PLUGIN_STATE_DISABLED ||
+			state == GAKU_PLUGIN_STATE_DEPENDENCY_ERROR ||
+			state == GAKU_PLUGIN_STATE_INCOMPATIBLE ||
+			state == GAKU_PLUGIN_STATE_FAILED;
+	}
+
+	const char* PluginLoadStateLabel(GakuPluginLoadState state) noexcept
+	{
+		switch (state)
+		{
+		case GAKU_PLUGIN_STATE_NOT_FOUND: return "not installed";
+		case GAKU_PLUGIN_STATE_DISABLED: return "disabled";
+		case GAKU_PLUGIN_STATE_DEPENDENCY_ERROR: return "dependency error";
+		case GAKU_PLUGIN_STATE_INCOMPATIBLE: return "incompatible";
+		case GAKU_PLUGIN_STATE_QUERIED: return "queried";
+		case GAKU_PLUGIN_STATE_ACTIVATED: return "activated";
+		case GAKU_PLUGIN_STATE_RUNTIME_READY: return "runtime-ready";
+		case GAKU_PLUGIN_STATE_FAILED: return "failed";
+		default: return "unknown";
+		}
+	}
+
+	void InspectPluginDependencies(PluginContext* ctx)
+	{
+		if (!ctx || !ctx->host.queryService) return;
+
+		GakuPluginsServiceV1 plugins{};
+		const GakuStatus st = ctx->host.queryService(
+			ctx->host.hostContext, GAKU_SERVICE_PLUGINS, GAKU_PLUGINS_SERVICE_VERSION, sizeof(plugins), &plugins);
+		if (st != GAKU_OK ||
+			plugins.abiVersion != GAKU_PLUGINS_SERVICE_VERSION ||
+			plugins.structSize < sizeof(GakuPluginsServiceV1) ||
+			!plugins.findPlugin)
+		{
+			return;
+		}
+
+		struct DependencySpec
+		{
+			const char* id;
+			bool required;
+			const char* impactNote;
+			bool PluginContext::* hasService;
+			bool PluginContext::* unavailableFlag;
+			uint8_t PluginContext::* diagLogged;
+		};
+
+		static constexpr DependencySpec kDeps[] = {
+			{"screenshotmanager", true, "frame capture unavailable",
+				&PluginContext::hasScreenshot, &PluginContext::screenshotUnavailable, &PluginContext::screenshotDiagLogged},
+			{"gakumotion", false, "lockstep clock disabled (freerun mode still available)",
+				&PluginContext::hasClock, &PluginContext::clockUnavailable, &PluginContext::clockDiagLogged},
+			{"gakuaudio", false, "offline DSP audio baking skipped",
+				&PluginContext::hasAudio, &PluginContext::audioUnavailable, &PluginContext::audioDiagLogged},
+		};
+
+		struct PendingLog
+		{
+			GakuLogLevel level;
+			std::string message;
+		};
+		std::vector<PendingLog> logs;
+		std::string activeSummary;
+
+		for (const auto& dep : kDeps)
+		{
+			GakuPluginSummaryV1 summary{};
+			if (plugins.findPlugin(dep.id, sizeof(summary), &summary) != GAKU_OK) continue;
+			if (summary.abiVersion != GAKU_PLUGINS_SERVICE_VERSION ||
+				summary.structSize < sizeof(GakuPluginSummaryV1))
+			{
+				continue;
+			}
+
+			const bool unavailable = IsUnavailablePluginState(summary.state);
+			const bool active =
+				summary.state == GAKU_PLUGIN_STATE_ACTIVATED ||
+				summary.state == GAKU_PLUGIN_STATE_RUNTIME_READY;
+			if (!unavailable && !active) continue;
+
+			std::lock_guard<std::mutex> lock(ctx->serviceCacheMutex);
+			if (unavailable)
+			{
+				if (!(ctx->*dep.hasService))
+				{
+					ctx->*dep.unavailableFlag = true;
+				}
+				if (ctx->*dep.diagLogged != 2u)
+				{
+					ctx->*dep.diagLogged = 2u;
+					logs.push_back({
+						dep.required ? GAKU_LOG_WARNING : GAKU_LOG_INFO,
+						std::string("[VideoExporter] ") +
+							(dep.required ? "Required" : "Optional") +
+							" dependency " + dep.id + " is " + PluginLoadStateLabel(summary.state) +
+							"; " + dep.impactNote + "."
+					});
+				}
+			}
+			else if (active && ctx->*dep.diagLogged == 0u)
+			{
+				ctx->*dep.diagLogged = 1u;
+				if (!activeSummary.empty()) activeSummary += ", ";
+				const char* ver = (summary.version[0] != '\0') ? summary.version : "unknown";
+				activeSummary += std::string(dep.id) + " v" + ver + " (" + PluginLoadStateLabel(summary.state) + ")";
+			}
+		}
+
+		if (!activeSummary.empty())
+		{
+			WriteLog(ctx, GAKU_LOG_INFO, "[VideoExporter] Dependencies via gakuloader.plugins: " + activeSummary + ".");
+		}
+		for (const auto& entry : logs)
+		{
+			WriteLog(ctx, entry.level, entry.message);
+		}
 	}
 
 	void MainThreadWakeTask(void* userData)
@@ -574,6 +723,7 @@ namespace
 			}
 		}
 
+		InspectPluginDependencies(rawCtx);
 		WriteLog(rawCtx, GAKU_LOG_INFO, "[VideoExporter] Activated (v0.1.0).");
 		*pluginState = ctx.release();
 		return GAKU_OK;
@@ -583,6 +733,7 @@ namespace
 	{
 		auto* ctx = static_cast<PluginContext*>(pluginState);
 		if (!ctx) return;
+		InspectPluginDependencies(ctx);
 		GakuScreenshotServiceV1 ss{};
 		GakuMotionClockServiceV1 clk{};
 		GakuAudioServiceV1 aud{};
@@ -646,5 +797,36 @@ extern "C" GAKU_PLUGIN_EXPORT GakuStatus GakuPlugin_Query(
 	desc.onDesktopUi = nullptr;
 	desc.shutdown = &Shutdown;
 	*output = desc;
+	return GAKU_OK;
+}
+
+extern "C" GAKU_PLUGIN_EXPORT GakuStatus GakuPlugin_QueryMetadata(
+	uint32_t requestedAbi, uint32_t outputSize, GakuPluginMetadataV1* output)
+{
+	if (requestedAbi != GAKU_METADATA_ABI_VERSION) return GAKU_E_VERSION;
+	if (!output) return GAKU_E_INVALID_ARGUMENT;
+	if (outputSize < sizeof(GakuPluginMetadataV1)) return GAKU_E_SIZE;
+
+	GakuPluginMetadataV1 meta{};
+	meta.abiVersion = GAKU_METADATA_ABI_VERSION;
+	meta.structSize = sizeof(GakuPluginMetadataV1);
+	meta.originalAuthor = "VideoExporter Contributors";
+	meta.maintainerCount = static_cast<uint32_t>(std::size(kPluginMaintainers));
+	meta.maintainers = kPluginMaintainers;
+	meta.subVersion = "";
+	meta.releaseChannel = "stable";
+	meta.summary = "4K lockstep video recorder and FFmpeg compositing plugin for GakuLoader.";
+	meta.localizedSummaryCount = static_cast<uint32_t>(std::size(kPluginLocalizedSummaries));
+	meta.localizedSummaries = kPluginLocalizedSummaries;
+	meta.repositoryUrl = "https://github.com/crested-ezios/VideoExporter";
+	meta.releaseUrl = "https://github.com/crested-ezios/VideoExporter/releases";
+	meta.issuesUrl = "https://github.com/crested-ezios/VideoExporter/issues";
+	meta.license = "MIT";
+	meta.minLoaderVersion = "1.1.0";
+	meta.dependencyCount = static_cast<uint32_t>(std::size(kPluginDependencies));
+	meta.dependencies = kPluginDependencies;
+	meta.auxiliaryDllCount = 0u;
+	meta.auxiliaryDlls = nullptr;
+	*output = meta;
 	return GAKU_OK;
 }

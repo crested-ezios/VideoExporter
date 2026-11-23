@@ -83,6 +83,7 @@
     <ClInclude Include="include\GakuPaths.h" />
     <ClInclude Include="include\GakuPaths.hpp" />
     <ClInclude Include="include\GakuPlugin.h" />
+    <ClInclude Include="include\GakuPluginMetadata.h" />
     <ClInclude Include="include\GakuScreenshot.h" />
     <ClInclude Include="include\GakuWebPanel.h" />
     <ClInclude Include="src\CommonUtils.hpp" />

@@ -9,6 +9,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+$contractCheck = Join-Path $repo 'tools\check_contract_headers.ps1'
+if (Test-Path -LiteralPath $contractCheck -PathType Leaf) {
+    $global:LASTEXITCODE = 0
+    & $contractCheck -RepoRoot $repo
+    if ($LASTEXITCODE -ne 0) {
+        throw ('Contract header parity check failed: ' + $LASTEXITCODE)
+    }
+}
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $repo 'build'
 }

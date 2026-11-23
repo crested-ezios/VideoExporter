@@ -8,6 +8,7 @@
 #include "../include/GakuMotionClock.h"
 #include "../include/GakuPaths.h"
 #include "../include/GakuPlugin.h"
+#include "../include/GakuPluginMetadata.h"
 #include "../include/GakuScreenshot.h"
 #include "../include/GakuWebPanel.h"
 
@@ -973,6 +974,62 @@ namespace
 		EXPECT(std::string(desc.version) == "0.1.0");
 		EXPECT(desc.activate != nullptr && desc.onTick != nullptr && desc.shutdown != nullptr);
 
+		auto queryMetaFn = reinterpret_cast<FnGakuPlugin_QueryMetadata>(GetProcAddress(mod, "GakuPlugin_QueryMetadata"));
+		EXPECT(queryMetaFn != nullptr);
+		if (queryMetaFn)
+		{
+			GakuPluginMetadataV1 meta{};
+			EXPECT(queryMetaFn(999u, sizeof(meta), &meta) == GAKU_E_VERSION);
+			EXPECT(queryMetaFn(GAKU_METADATA_ABI_VERSION, sizeof(meta), nullptr) == GAKU_E_INVALID_ARGUMENT);
+			EXPECT(queryMetaFn(GAKU_METADATA_ABI_VERSION, sizeof(meta) - 1u, &meta) == GAKU_E_SIZE);
+			EXPECT(queryMetaFn(GAKU_METADATA_ABI_VERSION, sizeof(meta), &meta) == GAKU_OK);
+			EXPECT(meta.abiVersion == GAKU_METADATA_ABI_VERSION);
+			EXPECT(meta.structSize == sizeof(GakuPluginMetadataV1));
+			EXPECT(meta.originalAuthor && std::string(meta.originalAuthor) == "VideoExporter Contributors");
+			EXPECT(meta.maintainerCount == 1u && meta.maintainers && meta.maintainers[0] &&
+				std::string(meta.maintainers[0]) == "crested-ezios");
+			EXPECT(meta.subVersion && std::string(meta.subVersion).empty());
+			EXPECT(meta.releaseChannel && std::string(meta.releaseChannel) == "stable");
+			EXPECT(meta.summary && std::string(meta.summary) == "4K lockstep video recorder and FFmpeg compositing plugin for GakuLoader.");
+			EXPECT(meta.localizedSummaryCount == 4u && meta.localizedSummaries != nullptr);
+			if (meta.localizedSummaryCount == 4u && meta.localizedSummaries)
+			{
+				const char* expectedLangs[] = {"en", "zh-Hans", "zh-Hant", "ja"};
+				for (uint32_t i = 0; i < 4u; ++i)
+				{
+					EXPECT(meta.localizedSummaries[i].languageTag &&
+						std::string(meta.localizedSummaries[i].languageTag) == expectedLangs[i]);
+					EXPECT(meta.localizedSummaries[i].text && meta.localizedSummaries[i].text[0] != '\0');
+				}
+			}
+			EXPECT(meta.repositoryUrl && std::string(meta.repositoryUrl) == "https://github.com/crested-ezios/VideoExporter");
+			EXPECT(meta.releaseUrl && std::string(meta.releaseUrl) == "https://github.com/crested-ezios/VideoExporter/releases");
+			EXPECT(meta.issuesUrl && std::string(meta.issuesUrl) == "https://github.com/crested-ezios/VideoExporter/issues");
+			EXPECT(meta.license && std::string(meta.license) == "MIT");
+			EXPECT(meta.minLoaderVersion && std::string(meta.minLoaderVersion) == "1.1.0");
+			EXPECT(meta.dependencyCount == 3u && meta.dependencies != nullptr);
+			if (meta.dependencyCount == 3u && meta.dependencies)
+			{
+				EXPECT(std::string(meta.dependencies[0].pluginId) == "screenshotmanager");
+				EXPECT(std::string(meta.dependencies[0].displayName) == "ScreenshotManager");
+				EXPECT(std::string(meta.dependencies[0].versionRange) == ">=0.1.0");
+				EXPECT(meta.dependencies[0].kind == GAKU_DEPENDENCY_REQUIRED);
+				EXPECT(meta.dependencies[0].reserved == 0u);
+
+				EXPECT(std::string(meta.dependencies[1].pluginId) == "gakumotion");
+				EXPECT(std::string(meta.dependencies[1].displayName) == "GakuMotion");
+				EXPECT(std::string(meta.dependencies[1].versionRange) == ">=0.1.1");
+				EXPECT(meta.dependencies[1].kind == GAKU_DEPENDENCY_OPTIONAL);
+				EXPECT(meta.dependencies[1].reserved == 0u);
+
+				EXPECT(std::string(meta.dependencies[2].pluginId) == "gakuaudio");
+				EXPECT(std::string(meta.dependencies[2].displayName) == "GakuAudio");
+				EXPECT(std::string(meta.dependencies[2].versionRange) == ">=0.1.0");
+				EXPECT(meta.dependencies[2].kind == GAKU_DEPENDENCY_OPTIONAL);
+				EXPECT(meta.dependencies[2].reserved == 0u);
+			}
+		}
+
 		// Simulate GakuLoader host registering services lazily AFTER Activate
 		struct HostState
 		{
@@ -1040,6 +1097,152 @@ namespace
 		EXPECT(stJson.BoolPath("result.services.screenshot.available", false));
 
 		desc.shutdown(pluginState);
+
+		// Verify gakuloader.plugins awareness: when gakumotion/gakuaudio are DISABLED/NOT_FOUND,
+		// VideoExporter logs a clear diagnostic and skips pointless queryService retries.
+		{
+			struct PluginsHostState
+			{
+				std::unordered_map<std::string, std::vector<uint8_t>> services;
+				std::vector<std::string> logs;
+				uint32_t clockQueryCount{0};
+				uint32_t audioQueryCount{0};
+			} pState;
+
+			MockScreenshotState mockSs2;
+			GakuScreenshotServiceV1 ssTbl2 = mockSs2.Service();
+			{
+				const auto* bytes = reinterpret_cast<const uint8_t*>(&ssTbl2);
+				pState.services[GAKU_SERVICE_SCREENSHOT_CAPTURE] = std::vector<uint8_t>(bytes, bytes + sizeof(ssTbl2));
+			}
+
+			GakuHostApi pHost{};
+			pHost.abiVersion = GAKU_ABI_VERSION;
+			pHost.structSize = sizeof(pHost);
+			pHost.hostContext = &pState;
+			pHost.registerService = [](void* ctx, const char* name, uint32_t tableSize, const void* table) -> GakuStatus {
+				auto* hs = static_cast<PluginsHostState*>(ctx);
+				const auto* bytes = static_cast<const uint8_t*>(table);
+				hs->services[name] = std::vector<uint8_t>(bytes, bytes + tableSize);
+				return GAKU_OK;
+			};
+			pHost.queryService = [](void* ctx, const char* name, uint32_t reqVer, uint32_t outSize, void* out) -> GakuStatus {
+				auto* hs = static_cast<PluginsHostState*>(ctx);
+				const std::string svcName(name ? name : "");
+				if (svcName == GAKU_SERVICE_MOTION_CLOCK) ++hs->clockQueryCount;
+				if (svcName == GAKU_SERVICE_AUDIO_CORE) ++hs->audioQueryCount;
+				if (svcName == GAKU_SERVICE_LOG && outSize >= sizeof(GakuLogService))
+				{
+					auto* lg = static_cast<GakuLogService*>(out);
+					lg->abiVersion = reqVer;
+					lg->structSize = sizeof(GakuLogService);
+					lg->context = hs;
+					lg->write = [](void* c, GakuLogLevel, const char* msg) {
+						auto* h = static_cast<PluginsHostState*>(c);
+						if (msg) h->logs.emplace_back(msg);
+					};
+					return GAKU_OK;
+				}
+				if (svcName == GAKU_SERVICE_PLUGINS && outSize >= sizeof(GakuPluginsServiceV1))
+				{
+					auto* ps = static_cast<GakuPluginsServiceV1*>(out);
+					ps->abiVersion = GAKU_PLUGINS_SERVICE_VERSION;
+					ps->structSize = sizeof(GakuPluginsServiceV1);
+					ps->getHostInfo = [](uint32_t osz, GakuHostInfoV1* o) -> GakuStatus {
+						if (!o) return GAKU_E_INVALID_ARGUMENT;
+						if (osz < sizeof(GakuHostInfoV1)) return GAKU_E_SIZE;
+						GakuHostInfoV1 info{};
+						info.abiVersion = GAKU_PLUGINS_SERVICE_VERSION;
+						info.structSize = sizeof(info);
+						info.pluginAbiVersion = GAKU_ABI_VERSION;
+						info.pluginCount = 3u;
+						std::snprintf(info.loaderVersion, sizeof(info.loaderVersion), "%s", GAKU_LOADER_VERSION);
+						*o = info;
+						return GAKU_OK;
+					};
+					ps->findPlugin = [](const char* pluginId, uint32_t osz, GakuPluginSummaryV1* o) -> GakuStatus {
+						if (!pluginId || !o) return GAKU_E_INVALID_ARGUMENT;
+						if (osz < sizeof(GakuPluginSummaryV1)) return GAKU_E_SIZE;
+						GakuPluginSummaryV1 s{};
+						s.abiVersion = GAKU_PLUGINS_SERVICE_VERSION;
+						s.structSize = sizeof(s);
+						std::snprintf(s.id, sizeof(s.id), "%s", pluginId);
+						if (std::strcmp(pluginId, "screenshotmanager") == 0)
+						{
+							s.state = GAKU_PLUGIN_STATE_ACTIVATED;
+							s.hasMetadata = 1u;
+							std::snprintf(s.name, sizeof(s.name), "ScreenshotManager");
+							std::snprintf(s.version, sizeof(s.version), "0.1.0");
+						}
+						else if (std::strcmp(pluginId, "gakumotion") == 0)
+						{
+							s.state = GAKU_PLUGIN_STATE_DISABLED;
+							std::snprintf(s.name, sizeof(s.name), "GakuMotion");
+							std::snprintf(s.version, sizeof(s.version), "0.1.1");
+						}
+						else
+						{
+							s.state = GAKU_PLUGIN_STATE_NOT_FOUND;
+						}
+						*o = s;
+						return GAKU_OK;
+					};
+					ps->getPluginAt = [](uint32_t, uint32_t, GakuPluginSummaryV1*) -> GakuStatus {
+						return GAKU_E_INVALID_ARGUMENT;
+					};
+					return GAKU_OK;
+				}
+				const auto it = hs->services.find(svcName);
+				if (it == hs->services.end()) return GAKU_E_UNAVAILABLE;
+				if (outSize < it->second.size()) return GAKU_E_SIZE;
+				std::memcpy(out, it->second.data(), it->second.size());
+				return GAKU_OK;
+			};
+
+			void* pPluginState = nullptr;
+			EXPECT(desc.activate(&pHost, &pPluginState) == GAKU_OK);
+			EXPECT(pPluginState != nullptr);
+			if (desc.onRuntimeReady) desc.onRuntimeReady(pPluginState);
+
+			GakuWebPanelServiceV1 wp2{};
+			std::memcpy(&wp2, pState.services["videoexporter.web-panel/v1"].data(), sizeof(wp2));
+			char respBuf2[16384]{};
+			uint32_t reqBytes2 = 0;
+			const std::string stReq2 = R"({"v":1,"id":11,"type":"request","method":"state.get","params":{}})";
+			EXPECT(wp2.handleMessage(wp2.context, stReq2.c_str(), sizeof(respBuf2), respBuf2, &reqBytes2) == GAKU_OK);
+			GakuMotion::jsonlite::Value stJson2;
+			std::string err2;
+			EXPECT(GakuMotion::jsonlite::ParseText(respBuf2, stJson2, err2));
+			EXPECT(stJson2.BoolPath("result.services.screenshot.available", false));
+			EXPECT(!stJson2.BoolPath("result.services.clock.available", true));
+			EXPECT(!stJson2.BoolPath("result.services.audio.available", true));
+			EXPECT(pState.clockQueryCount == 0u);
+			EXPECT(pState.audioQueryCount == 0u);
+
+			bool sawMotionDiag = false;
+			bool sawAudioDiag = false;
+			bool sawScreenshotVersion = false;
+			for (const auto& line : pState.logs)
+			{
+				if (line.find("gakumotion") != std::string::npos && line.find("disabled") != std::string::npos)
+				{
+					sawMotionDiag = true;
+				}
+				if (line.find("gakuaudio") != std::string::npos && line.find("offline DSP audio baking skipped") != std::string::npos)
+				{
+					sawAudioDiag = true;
+				}
+				if (line.find("screenshotmanager v0.1.0") != std::string::npos)
+				{
+					sawScreenshotVersion = true;
+				}
+			}
+			EXPECT(sawMotionDiag);
+			EXPECT(sawAudioDiag);
+			EXPECT(sawScreenshotVersion);
+
+			desc.shutdown(pPluginState);
+		}
 		FreeLibrary(mod);
 	}
 
